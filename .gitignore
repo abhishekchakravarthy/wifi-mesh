@@ -1,0 +1,89 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Build outputs
+bin/
+build/
+dist/
+*.elf
+*.bin
+*.map
+*.hex
+
+# Arduino IDE
+*.ino.bak
+esp32_b_arduino_project/
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+
+# Test and debugging scripts (keep only essential ones)
+test_*.py
+*_test.py
+debug_*.py
+diagnose_*.py
+check_*.py
+monitor_*.py
+get_*.py
+simple_*.py
+quick_*.py
+robust_*.py
+complete_*.py
+data_*.py
+audio_*.py
+
+# Android build artifacts
+android/app/build/
+android/.gradle/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/.gradle/
+android/gradle/
+android/app/.gradle/
+android/build/
+android/app/build/
+
+# Android SDK (too large for git)
+android-sdk/
+
+# PlatformIO configuration overrides
+esp32_b_platformio.ini
+esp32_b_client.ino
+
+# Temporary and log files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Backup files
+*.bak
+*.backup
+*.old
