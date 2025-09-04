@@ -13,7 +13,7 @@ class OpusEncoder {
         private const val TAG = "OpusEncoder"
         private const val SAMPLE_RATE = 16000
         private const val CHANNELS = 1
-        private const val FRAME_SIZE = 160 // 10ms at 16kHz
+        private const val FRAME_SIZE = 100 // 6.25ms at 16kHz
         private const val BITRATE = 16000 // 16kbps for voice quality
         private const val MAX_FRAME_SIZE = 1275 // Maximum Opus frame size
     }

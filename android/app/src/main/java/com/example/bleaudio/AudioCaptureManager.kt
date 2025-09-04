@@ -16,8 +16,8 @@ class AudioCaptureManager(
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val FRAME_SIZE = 160  // Back to 10ms at 16kHz
-        private const val COMPRESSED_FRAME_SIZE = 320  // Back to working size
+        private const val FRAME_SIZE = 100  // 6.25ms at 16kHz (matches ESP32 chunk size)
+        private const val COMPRESSED_FRAME_SIZE = 200  // 100 samples * 2 bytes = 200 bytes
         private const val PREBUFFER_BYTES = 1280 // 40ms of 16-bit mono
         
             // Direct playback - no buffering for minimal latency
@@ -97,8 +97,8 @@ class AudioCaptureManager(
 
             Log.d(TAG, "Audio recording started - ADPCM compression mode")
             Log.d(TAG, "Sample rate: $SAMPLE_RATE Hz")
-            Log.d(TAG, "Frame size: $FRAME_SIZE samples (10ms)")
-            Log.d(TAG, "Compressed frame size: $COMPRESSED_FRAME_SIZE bytes (4:1 compression)")
+            Log.d(TAG, "Frame size: $FRAME_SIZE samples (6.25ms)")
+            Log.d(TAG, "Compressed frame size: $COMPRESSED_FRAME_SIZE bytes (raw PCM)")
 
             // Prime the audio buffer to avoid initial cut-off
             Log.d(TAG, "Priming audio buffer...")
@@ -312,11 +312,11 @@ class AudioCaptureManager(
     
     // Background thread for synchronized stream processing (inspired by ESP32 I2S WiFi Radio)
     private suspend fun processSynchronizedStream() {
-        val playbackData = ByteArray(320) // Back to 320-byte chunks (160 samples)
+        val playbackData = ByteArray(200) // 200-byte chunks (100 samples)
         var lastPlayTime = 0L
-        val targetInterval = 10L // Back to 10ms intervals
+        val targetInterval = 6L // 6.25ms intervals
         var consecutiveEmptyReads = 0
-        val maxEmptyReads = 50 // Stop if no data for 500ms
+        val maxEmptyReads = 80 // Stop if no data for 500ms
         
         while (isStreamStarted) {
             try {
@@ -324,35 +324,26 @@ class AudioCaptureManager(
                 var dataProcessed = false
                 
                 synchronized(streamLock) {
-                    if (streamBufferSize >= 320) {
+                    if (streamBufferSize >= 200) {
                         // Get data from stream buffer with proper circular buffer handling
                         val startIndex = (streamBufferIndex - streamBufferSize + streamBuffer.size) % streamBuffer.size
-                        for (i in 0 until 320) {
+                        for (i in 0 until 200) {
                             val bufferIndex = (startIndex + i) % streamBuffer.size
                             playbackData[i] = streamBuffer[bufferIndex]
                         }
-                        streamBufferSize -= 320
+                        streamBufferSize -= 200
                         
-                        // Process the audio data
-                        val decodedSamples = decompressSimple(playbackData, 320, decodedBuffer)
+                        // Process the audio data - it's already raw 16-bit PCM, no decompression needed
+                        // ESP32 B sends raw 16-bit PCM data directly
+                        val pcmBytes = ByteArray(200) // 200 bytes = 100 samples * 2 bytes
+                        System.arraycopy(playbackData, 0, pcmBytes, 0, 200)
                         
-                        if (decodedSamples > 0) {
-                            // Convert to PCM bytes for AudioTrack with proper byte ordering
-                            val pcmBytes = ByteArray(decodedSamples * 2)
-                            for (i in 0 until decodedSamples) {
-                                val sample = decodedBuffer[i]
-                                // Ensure proper little-endian byte order for AudioTrack
-                                pcmBytes[i * 2] = (sample.toInt() and 0xFF).toByte() // Low byte
-                                pcmBytes[i * 2 + 1] = (sample.toInt() shr 8).toByte() // High byte
-                            }
-                            
-                            // Play the audio with blocking write for better synchronization
-                            val written = audioTrack?.write(pcmBytes, 0, pcmBytes.size, AudioTrack.WRITE_BLOCKING) ?: 0
-                            if (written > 0) {
-                                Log.v(TAG, "Synchronized stream: $written bytes, buffer: ${streamBufferSize} bytes")
-                                dataProcessed = true
-                                consecutiveEmptyReads = 0
-                            }
+                        // Play the audio with blocking write for better synchronization
+                        val written = audioTrack?.write(pcmBytes, 0, pcmBytes.size, AudioTrack.WRITE_BLOCKING) ?: 0
+                        if (written > 0) {
+                            Log.v(TAG, "Synchronized stream: $written bytes, buffer: ${streamBufferSize} bytes")
+                            dataProcessed = true
+                            consecutiveEmptyReads = 0
                         }
                         
                         lastPlayTime = currentTime

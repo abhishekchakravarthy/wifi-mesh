@@ -74,7 +74,7 @@ bool oldBleDeviceConnected = false;
 // BLE error handling removed - simplified to match working coordinator
 
 // Audio buffer
-uint8_t audioBuffer[320];
+uint8_t audioBuffer[200];
 size_t audioBufferIndex = 0;
 
 // Statistics
@@ -129,49 +129,17 @@ void sendTestAck(const uint8_t* mac, int testId, const String& status);
 void processReceivedAudioData(const uint8_t* audioData, int length, int sequence, int chunk, int totalChunks);
 void sendAudioAck(const uint8_t* mac, int sequence, int chunk, const String& status);
 
-// Decompression for coordinator's optimized audio format
-//  - Primary: RLE with 0xFF marker, format: 0xFF, value, count (for runs >3)
-//  - Otherwise: literal bytes
-//  - Fallback: 4-bit packing (two 4-bit high nibbles packed into one byte)
+// RAW PCM: No decompression - direct data passthrough
 static int decompressOptimizedAudio(const uint8_t* compressedData, int compressedLen,
                                     uint8_t* output, int outputMax) {
   if (!compressedData || compressedLen <= 0 || !output || outputMax <= 0) {
     return 0;
   }
 
-  // Heuristic: if packed length * 2 equals expected 240 bytes, assume 4-bit packing fallback
-  if (compressedLen * 2 == 240 || (compressedLen * 2 <= outputMax && compressedLen * 2 >= 220)) {
-    int outIndex = 0;
-    for (int i = 0; i < compressedLen && outIndex + 1 < outputMax; i++) {
-      uint8_t b = compressedData[i];
-      uint8_t hi = (b >> 4) & 0x0F;
-      uint8_t lo = b & 0x0F;
-      // Expand nibble to 8-bit space (simple scale)
-      output[outIndex++] = (hi << 4) | hi;
-      if (outIndex < outputMax) {
-        output[outIndex++] = (lo << 4) | lo;
-      }
-    }
-    return outIndex;
-  }
-
-  // Otherwise attempt RLE + literals
-  int outIndex = 0;
-  for (int i = 0; i < compressedLen && outIndex < outputMax; ) {
-    uint8_t v = compressedData[i++];
-    if (v == 0xFF) {
-      if (i + 1 >= compressedLen) break; // malformed
-      uint8_t value = compressedData[i++];
-      uint8_t count = compressedData[i++];
-      for (int c = 0; c < count && outIndex < outputMax; c++) {
-        output[outIndex++] = value;
-      }
-    } else {
-      // literal byte
-      output[outIndex++] = v;
-    }
-  }
-  return outIndex;
+  // Direct copy - no decompression needed
+  int copyLen = (compressedLen < outputMax) ? compressedLen : outputMax;
+  memcpy(output, compressedData, copyLen);
+  return copyLen;
 }
 
 // Audio processing functions
@@ -198,21 +166,20 @@ void processReceivedAudioData(const uint8_t* audioData, int length, int sequence
   packetsReceived++;
   bytesReceived += length;
   
-  // 🎯 FORWARD AUDIO DATA TO PHONE B VIA BLE
+  // 🎯 FORWARD AUDIO DATA TO PHONE B VIA BLE (using queue-based system)
   if (bleDeviceConnected && pAudioCharacteristic) {
-    Serial.printf("📱 Forwarding audio chunk %d/%d to Phone B via BLE (%d bytes)\n", 
+    Serial.printf("📱 Queueing audio chunk %d/%d for BLE forwarding (%d bytes)\n", 
                   chunk + 1, totalChunks, length);
     
-    // Set the audio data in the BLE characteristic (cast to non-const for BLE)
-    pAudioCharacteristic->setValue((uint8_t*)audioData, length);
-    
-    // Notify Phone B that new audio data is available
-    pAudioCharacteristic->notify();
-    
-    Serial.printf("✅ Audio chunk %d/%d successfully forwarded to Phone B!\n", chunk + 1, totalChunks);
+    // Use queue-based forwarding for better performance and reliability
+    if (!notifyQueuePushFromISR(audioData, (uint16_t)length, 0)) {
+      Serial.printf("⚠️ BLE queue full, dropping audio chunk %d/%d\n", chunk + 1, totalChunks);
+    } else {
+      Serial.printf("✅ Audio chunk %d/%d queued for BLE transmission\n", chunk + 1, totalChunks);
+    }
     
     // Log BLE transmission details
-    Serial.printf("📊 BLE Transmission - Size: %d bytes, Sequence: %d, Chunk: %d/%d\n",
+    Serial.printf("📊 BLE Queue - Size: %d bytes, Sequence: %d, Chunk: %d/%d\n",
                   length, sequence, chunk + 1, totalChunks);
     
   } else {
@@ -560,9 +527,9 @@ void sendTestAck(const uint8_t* mac, int testId, const String& status) {
   }
 }
 
-// Parse compact header A:seq:chunk:total:timestamp:sample_rate:bits:min:max
+// Parse compact header P:seq:chunk:total:timestamp:sample_rate:bits:min:max
 static bool parseCompactAudioHeader(const uint8_t* data, int len, int* values, int& dataStart) {
-  if (len < 5 || data[0] != 'A' || data[1] != ':') return false;
+  if (len < 5 || data[0] != 'P' || data[1] != ':') return false;
   int idx = 2;
   int field = 0;
   int current = 0;
@@ -582,7 +549,7 @@ static bool parseCompactAudioHeader(const uint8_t* data, int len, int* values, i
     }
   }
   if (field == 8) {
-    dataStart = idx; // everything after last ':' is compressed payload
+    dataStart = idx; // everything after last ':' is raw PCM payload
     return dataStart < len;
   }
   return false;
@@ -602,6 +569,7 @@ static void bleNotifyTask(void* pv) {
       NotifyItem item;
       if (!notifyQueuePop(item)) break;
       if (item.isPcm8) {
+        // Convert 8-bit PCM to 16-bit PCM (legacy support)
         static uint8_t pcm16[512];
         int outLen = 0;
         for (int i = 0; i < item.length && outLen + 2 <= (int)sizeof(pcm16); i++) {
@@ -614,17 +582,15 @@ static void bleNotifyTask(void* pv) {
         memcpy(coalesceBuf + coalesceLen, pcm16, copy);
         coalesceLen += copy;
       } else {
-        // We no longer forward compressed; treat as silence if encountered
-        static uint8_t silence[240];
-        memset(silence, 128, sizeof(silence));
-        int copy = min((int)sizeof(silence), (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, silence, copy);
+        // Raw 16-bit PCM data - forward directly without any processing
+        int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
+        memcpy(coalesceBuf + coalesceLen, item.data, copy);
         coalesceLen += copy;
       }
       ingested++;
     }
-    // Timed flush: send whenever at least 320B is ready; cap to 1280B per tick
-    if (bleDeviceConnected && pAudioCharacteristic && coalesceLen >= 320) {
+    // Timed flush: send whenever at least 200B is ready; cap to 1280B per tick
+    if (bleDeviceConnected && pAudioCharacteristic && coalesceLen >= 200) {
       int toSend = min(coalesceLen, 1280);
       int sent = 0;
       while (sent < toSend) {
@@ -788,10 +754,10 @@ void setup() {
       }
       processed++;
     }
-    // Timed flush every ~25 ms or if buffer has >= 320B ready; cap per-flush to 1280B
+    // Timed flush every ~25 ms or if buffer has >= 200B ready; cap per-flush to 1280B
     uint32_t nowMs = millis();
     if (nextFlushMs == 0) nextFlushMs = nowMs + 25;
-    if (coalesceLen >= 320 || nowMs >= nextFlushMs) {
+    if (coalesceLen >= 200 || nowMs >= nextFlushMs) {
       int toSend = min(coalesceLen, 1280);
       int sent = 0;
       while (sent < toSend) {
@@ -812,9 +778,9 @@ void setup() {
 void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   static unsigned long lastBrief = 0; if (millis() - lastBrief > 1000) { lastBrief = millis(); Serial.printf("Mesh RX len=%d\n", len); }
   
-  // Check for compact audio chunk format first (A:...)
-  if (len > 2 && data[0] == 'A' && data[1] == ':') {
-    // Compact audio chunk from coordinator
+  // Check for raw PCM audio chunk format first (P:...)
+  if (len > 2 && data[0] == 'P' && data[1] == ':') {
+    // Raw PCM audio chunk from coordinator
     int values[8]; int dataStart = 0;
     if (parseCompactAudioHeader(data, len, values, dataStart)) {
       int sequence = values[0];
@@ -826,43 +792,43 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       uint16_t minVal = (uint16_t)values[6];
       uint16_t maxVal = (uint16_t)values[7];
       // Minimal meta log (throttled above)
-      if (millis() - lastBrief > 1000) { lastBrief = millis(); Serial.printf("Audio Chunk %d/%d - Seq: %d, Rate: %d Hz, Bits: %d, Time: %lu\n", 
+      if (millis() - lastBrief > 1000) { lastBrief = millis(); Serial.printf("Raw PCM Chunk %d/%d - Seq: %d, Rate: %d Hz, Bits: %d, Time: %lu\n", 
                     chunk + 1, totalChunks, sequence, sampleRate, bitsPerSample, timestamp); }
       if (dataStart > 0 && dataStart < len) {
-        const uint8_t* compressedPtr = ((const uint8_t*)data) + dataStart;
-        int compressedSize = len - dataStart;
+        const uint8_t* rawPtr = ((const uint8_t*)data) + dataStart;
+        int rawSize = len - dataStart;
         // Logging disabled in hot path
 
-        // Decompress to a working buffer (target ~240 bytes)
-        uint8_t decompressed[256];
-        int decompressedLen = decompressOptimizedAudio(compressedPtr,
-                                                       compressedSize,
-                                                       decompressed,
-                                                       sizeof(decompressed));
-        if (decompressedLen <= 0 || decompressedLen > (int)sizeof(decompressed)) {
-          // If decompression failed, treat as silence to keep cadence
+        // Process raw PCM data directly (no decompression needed)
+        uint8_t processed[256];
+        int processedLen = decompressOptimizedAudio(rawPtr,
+                                                   rawSize,
+                                                   processed,
+                                                   sizeof(processed));
+        if (processedLen <= 0 || processedLen > (int)sizeof(processed)) {
+          // If processing failed, treat as silence to keep cadence
           static uint8_t silence[240];
           memset(silence, 128, sizeof(silence));
-          decompressedLen = sizeof(silence);
-          memcpy(decompressed, silence, sizeof(silence));
+          processedLen = sizeof(silence);
+          memcpy(processed, silence, sizeof(silence));
         }
         if (bleDeviceConnected) {
-          (void)notifyQueuePushFromISR(decompressed, decompressedLen, 1);
+          (void)notifyQueuePushFromISR(processed, processedLen, 0);  // Raw 16-bit PCM
         } // drop silently if BLE not connected
 
         // Stats
         packetsReceived++;
-        bytesReceived += compressedSize;
+        bytesReceived += rawSize;
 
         // ACK
         sendAudioAck(esp32_a_mac, sequence, chunk, "received");
       } else {
-        Serial.println("❌ No compressed audio data found in message");
+        Serial.println("❌ No raw PCM audio data found in message");
       }
     } else {
-      Serial.printf("❌ Invalid compact audio chunk format, expected 8 values, got %d\n", 8);
+      Serial.printf("❌ Invalid raw PCM audio chunk format, expected 8 values, got %d\n", 8);
     }
-    return; // Skip JSON parsing for compact format
+    return; // Skip JSON parsing for raw PCM format
   }
   // Binary framing: 'W','M', type(0=PCM8), seq(le16), len(le16), payload
   if (len >= 7 && data[0] == 'W' && data[1] == 'M') {
@@ -1185,10 +1151,10 @@ void loop() {
       }
       processed++;
     }
-    // Timed flush every ~10 ms or if buffer has >= 320B ready; cap per-flush to 1440B
+    // Timed flush every ~10 ms or if buffer has >= 200B ready; cap per-flush to 1440B
     uint32_t nowMs = millis();
     if (nextFlushMs == 0) nextFlushMs = nowMs + 10;
-    if (coalesceLen >= 320 || nowMs >= nextFlushMs) {
+    if (coalesceLen >= 200 || nowMs >= nextFlushMs) {
       int toSend = min(coalesceLen, 1440);
       int sent = 0;
       while (sent < toSend) {

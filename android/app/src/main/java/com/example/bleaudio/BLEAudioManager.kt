@@ -447,7 +447,7 @@ class BLEAudioManager(
             return
         }
         
-        // ESP32 is now sending complete audio frames (320 bytes)
+        // ESP32 is now sending complete audio frames (200 bytes)
         // No need for buffering - send directly to audio playback
         Log.d(TAG, "=== COMPLETE AUDIO FRAME RECEIVED ===")
         Log.d(TAG, "Received ${chunk.size} bytes (complete frame)")

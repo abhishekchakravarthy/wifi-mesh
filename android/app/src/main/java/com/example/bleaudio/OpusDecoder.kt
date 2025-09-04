@@ -13,7 +13,7 @@ class OpusDecoder {
         private const val TAG = "OpusDecoder"
         private const val SAMPLE_RATE = 16000
         private const val CHANNELS = 1
-        private const val FRAME_SIZE = 160 // 10ms at 16kHz
+        private const val FRAME_SIZE = 100 // 6.25ms at 16kHz
     }
 
     private var decoder: Long = 0 // Native Opus decoder pointer

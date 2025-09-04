@@ -288,25 +288,9 @@ void updateMeshStatusLED() {
 }
 
 void processAudioData(uint8_t* data, size_t length) {
-  // Store audio data
-    if (length <= AUDIO_BUFFER_SIZE) {
-        memcpy(audioBuffer, data, length);
-    audioBufferSize = length;
-    
-    // Analyze audio data
-    analyzeAudioData(data, length);
-    
-    // Forward audio to all mesh devices
-    if (meshNetworkActive && meshDeviceCount > 0) {
-      relayAudioToMesh(nullptr, data, length); // nullptr means from BLE (not from mesh)
-      isAudioStreaming = true;
-      lastAudioStats = millis();
-    } else {
-      Serial.println("No mesh devices connected, audio not forwarded");
-    }
-  } else {
-    Serial.printf("Audio data too large: %d bytes (max: %d)\n", length, AUDIO_BUFFER_SIZE);
-    }
+  // DEPRECATED: This function is no longer used
+  // Audio now flows through: BLE → addAudioData() → sendAudioChunks() → P: format
+  Serial.println("⚠️ processAudioData() called - this should not happen with new audio flow");
 }
 
 void analyzeAudioData(uint8_t* data, size_t length) {
@@ -833,19 +817,17 @@ class MyCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// Audio streaming constants for ESP-NOW - OPTIMIZED
-#define AUDIO_CHUNK_SIZE 240  // Optimized for ESP-NOW (250 byte limit with overhead)
-#define AUDIO_SAMPLE_RATE 16000  // Increased to 16kHz for better quality
-#define AUDIO_BITS_PER_SAMPLE 16  // Increased to 16-bit for better quality
-#define AUDIO_CHANNELS 1  // Mono
-#define AUDIO_COMPRESSION_RATIO 2  // Target compression ratio
+// Audio streaming constants for ESP-NOW - FIT ESP-NOW LIMITS
+#define AUDIO_CHUNK_SIZE 200  // 100 samples * 2 bytes = 200 bytes (fits in 250B ESP-NOW limit)
+#define AUDIO_SAMPLE_RATE 16000  // Match Android: 16kHz
+#define AUDIO_BITS_PER_SAMPLE 16  // Match Android: 16-bit
+#define AUDIO_CHANNELS 1  // Match Android: Mono
+#define AUDIO_COMPRESSION_RATIO 1  // No compression - raw PCM
 
-// Audio streaming variables for ESP-NOW - OPTIMIZED
+// Audio streaming variables for ESP-NOW - RAW PCM
 int audioBufferIndex = 0;
 unsigned long lastAudioChunk = 0;
 int audioSequenceNumber = 0;
-uint8_t compressedBuffer[AUDIO_CHUNK_SIZE];  // Compressed audio buffer
-int compressedBufferSize = 0;
 
 // Queue to defer BLE onWrite processing out of BLE stack task
 struct IncomingBleItem {
@@ -946,84 +928,23 @@ void addAudioData(const uint8_t* data, int length) {
   }
 }
 
-// OPTIMIZED: Enhanced audio compression using multiple techniques
+// RAW PCM: No compression - direct data passthrough
 int compressAudioData(const uint8_t* input, int inputLength, uint8_t* output) {
   if (inputLength <= 0 || input == nullptr || output == nullptr) return 0;
   
-  int outputIndex = 0;
-  
-  // Technique 1: Run-length encoding for repeated values
-  uint8_t currentValue = input[0];
-  uint8_t count = 1;
-  
-  for (int i = 1; i < inputLength; i++) {
-    if (input[i] == currentValue && count < 255) {
-      count++;
-    } else {
-      // Write run-length encoded data
-      if (count > 3) {
-        // Use run-length encoding for 4+ repeated values
-        output[outputIndex++] = 0xFF; // Marker for RLE
-        output[outputIndex++] = currentValue;
-        output[outputIndex++] = count;
-      } else {
-        // Write individual values for short runs
-        for (int j = 0; j < count; j++) {
-          output[outputIndex++] = currentValue;
-        }
-      }
-      currentValue = input[i];
-      count = 1;
-    }
-  }
-  
-  // Handle last run
-  if (count > 3) {
-    output[outputIndex++] = 0xFF;
-    output[outputIndex++] = currentValue;
-    output[outputIndex++] = count;
-  } else {
-    for (int j = 0; j < count; j++) {
-      output[outputIndex++] = currentValue;
-    }
-  }
-  
-  // Technique 2: If no compression achieved, use simple packing
-  if (outputIndex >= inputLength) {
-    // Fallback: simple 4-bit packing for better compression
-    outputIndex = 0;
-    for (int i = 0; i < inputLength; i += 2) {
-      if (i + 1 < inputLength) {
-        // Pack two 8-bit values into one byte (4-bit each)
-        uint8_t high = (input[i] >> 4) & 0x0F;
-        uint8_t low = (input[i + 1] >> 4) & 0x0F;
-        output[outputIndex++] = (high << 4) | low;
-      } else {
-        // Handle odd byte
-        output[outputIndex++] = (input[i] >> 4) & 0x0F;
-      }
-    }
-  }
-  
-  return outputIndex;
+  // Direct copy - no compression
+  memcpy(output, input, inputLength);
+  return inputLength;
 }
 
-// OPTIMIZED: Calculate audio statistics efficiently
+// RAW PCM: Simplified audio statistics (minimal overhead)
 void calculateAudioStats(const uint8_t* data, int length, uint16_t& minVal, uint16_t& maxVal, uint32_t& avgVal) {
   if (length <= 0 || data == nullptr) return;
   
-  uint32_t sum = 0;
-  minVal = 65535;
-  maxVal = 0;
-  
-  for (int i = 0; i < length; i++) {
-    uint16_t sample = data[i];
-    sum += sample;
-    if (sample < minVal) minVal = sample;
-    if (sample > maxVal) maxVal = sample;
-  }
-  
-  avgVal = sum / length;
+  // Minimal stats for compatibility - set to neutral values
+  minVal = 128;
+  maxVal = 128;
+  avgVal = 128;
 }
 
 // Send a single 240-byte 1kHz 8-bit beep frame via optimized A: chunk
@@ -1034,34 +955,37 @@ void sendBeepOnce() {
   }
   // Send a longer beep (~2000 ms)
   const int beepMs = 5000;
-  const int totalFrames = max(1, beepMs / 15); // 240 samples @16kHz ≈ 15ms/frame
+  const int totalFrames = max(1, (int)(beepMs / 6.25)); // 100 samples @16kHz = 6.25ms/frame
   
-  // Precompute one 240-sample 1kHz sine frame (16kHz sample rate)
-  static uint8_t sineFrame[AUDIO_CHUNK_SIZE];
+  // Precompute one 100-sample 1kHz sine frame (16-bit PCM, 16kHz sample rate)
+  static uint8_t sineFrame[AUDIO_CHUNK_SIZE]; // 200 bytes for 100 samples × 2 bytes
   static bool sineInit = false;
   if (!sineInit) {
-    for (int n = 0; n < AUDIO_CHUNK_SIZE; n++) {
+    for (int n = 0; n < 100; n++) { // 100 samples for 200 bytes
       float t = (float)n / 16000.0f;
       float s = sinf(2.0f * 3.1415926f * 1000.0f * t);
-      int v = (int)(128.0f + 90.0f * s);
-      if (v < 0) v = 0; if (v > 255) v = 255;
-      sineFrame[n] = (uint8_t)v;
+      int16_t sample = (int16_t)(s * 16383.0f); // 16-bit signed sample
+      
+      // Convert to little-endian 16-bit PCM
+      sineFrame[n * 2] = (uint8_t)(sample & 0xFF);        // Low byte
+      sineFrame[n * 2 + 1] = (uint8_t)((sample >> 8) & 0xFF); // High byte
     }
     sineInit = true;
   }
   uint32_t nextSendUs = micros();
-  const uint32_t framePeriodUs = 15000; // exact 15 ms pacing for 240 samples at 16 kHz
+  const uint32_t framePeriodUs = 6250; // exact 6.25 ms pacing for 100 samples at 16 kHz
   for (int f = 0; f < totalFrames; f++) {
     while ((int32_t)(micros() - nextSendUs) < 0) {
       delayMicroseconds(200);
     }
-    int compressedSize = compressAudioData(sineFrame, AUDIO_CHUNK_SIZE, compressedBuffer);
+    uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
+    int rawSize = compressAudioData(sineFrame, AUDIO_CHUNK_SIZE, rawBuffer);
     uint16_t minVal, maxVal; uint32_t avgVal;
     calculateAudioStats(sineFrame, AUDIO_CHUNK_SIZE, minVal, maxVal, avgVal);
 
     char messageBuffer[300];
     int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
-                              "A:%d:%d:%d:%d:%d:%d:%d:%d",
+                              "P:%d:%d:%d:%d:%d:%d:%d:%d",
                               audioSequenceNumber++, f, totalFrames,
                               millis(), AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE,
                               minVal, maxVal);
@@ -1072,9 +996,9 @@ void sendBeepOnce() {
       nextSendUs += framePeriodUs;
       continue; // header too large, skip this frame
     }
-    int toCopy = (compressedSize < availableForData) ? compressedSize : availableForData;
+    int toCopy = (rawSize < availableForData) ? rawSize : availableForData;
     messageBuffer[messageLen++] = ':';
-    memcpy(messageBuffer + messageLen, compressedBuffer, toCopy);
+    memcpy(messageBuffer + messageLen, rawBuffer, toCopy);
     messageLen += toCopy;
     for (int i = 0; i < meshDeviceCount; i++) {
       if (meshDevices[i].isActive) {
@@ -1100,48 +1024,43 @@ void sendAudioChunks() {
   int chunksToSend = audioBufferIndex / AUDIO_CHUNK_SIZE;
   
   for (int chunk = 0; chunk < chunksToSend; chunk++) {
-            // OPTIMIZED: Compress audio data before transmission
+        // RAW PCM: Direct audio data transmission
         int startIndex = chunk * AUDIO_CHUNK_SIZE;
-        int compressedSize = compressAudioData(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, compressedBuffer);
+        uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
+        int rawSize = compressAudioData(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, rawBuffer);
         
         // Calculate audio statistics efficiently
         uint16_t minVal, maxVal;
         uint32_t avgVal;
         calculateAudioStats(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, minVal, maxVal, avgVal);
         
-        // Create optimized audio chunk message (minimal JSON)
+        // Create raw PCM audio chunk message
         char messageBuffer[300];  // Pre-allocated buffer for efficiency
         int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
-                                 "A:%d:%d:%d:%d:%d:%d:%d:%d",
+                                 "P:%d:%d:%d:%d:%d:%d:%d:%d",
                                  audioSequenceNumber++, chunk, chunksToSend,
                                  millis(), AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE,
                                  minVal, maxVal);
         
-        // Add compressed audio data directly (no hex conversion)
-        if (messageLen + compressedSize + 1 < sizeof(messageBuffer)) {
+        // Add raw PCM audio data directly
+        if (messageLen + rawSize + 1 < sizeof(messageBuffer)) {
             messageBuffer[messageLen++] = ':';
-            memcpy(messageBuffer + messageLen, compressedBuffer, compressedSize);
-            messageLen += compressedSize;
+            memcpy(messageBuffer + messageLen, rawBuffer, rawSize);
+            messageLen += rawSize;
         }
         
-                // Enhanced logging for compression verification
-        // Serial.printf("📡 Sending OPTIMIZED audio chunk %d/%d (size: %d bytes, compressed: %d bytes)\n", chunk + 1, chunksToSend, messageLen, compressedSize);
-        
-        // Log compression details for verification
-        // Serial.printf("🗜️ Compression: Original: %d, Compressed: %d\n", AUDIO_CHUNK_SIZE, compressedSize);
-        
         // CRITICAL: Ensure message fits within ESP-NOW limits (250 bytes)
+        // Note: With 200-byte audio chunks, they fit within ESP-NOW limits
         if (messageLen > 250) {
-          Serial.printf("⚠️ Message too large (%d bytes), truncating to fit ESP-NOW limit\n", messageLen);
-          
-          // Truncate message to fit within limits
-          int maxDataSize = 250 - (messageLen - compressedSize);
-          if (maxDataSize > 0) {
-            messageLen = 250;
-            Serial.printf("🗜️ Truncated compressed data to %d bytes\n", maxDataSize);
+          Serial.printf("⚠️ Message too large for ESP-NOW: %d bytes (max 250)\n", messageLen);
+          // Split large audio chunks into smaller pieces
+          int maxAudioData = 250 - messageLen + rawSize; // Available space for audio data
+          if (maxAudioData > 0) {
+            messageLen = messageLen - rawSize + maxAudioData; // Adjust message length
+            memcpy(messageBuffer + (messageLen - maxAudioData), rawBuffer, maxAudioData);
           } else {
-            Serial.printf("❌ Cannot fit message within ESP-NOW limits, skipping chunk\n", messageLen);
-            continue; // Skip this chunk
+            Serial.printf("❌ Header too large, skipping chunk\n");
+            continue;
           }
         }
         
@@ -1220,7 +1139,8 @@ void handleTestCommand(const String& command) {
     }
     
     // Test compression
-    int compressedSize = compressAudioData(testData, 240, compressedBuffer);
+    uint8_t testBuffer[240];
+    int compressedSize = compressAudioData(testData, 240, testBuffer);
     float compressionRatio = (float)240 / compressedSize;
     float compressionPercent = (float)(240 - compressedSize) / 240 * 100.0;
     
@@ -1424,11 +1344,8 @@ void loop() {
   
   // Handle BLE connections
   if (deviceConnected) {
-    // Process any pending audio data
-    if (audioBufferSize > 0) {
-      processAudioData(audioBuffer, audioBufferSize);
-      audioBufferSize = 0;
-    }
+    // Audio processing now handled by addAudioData() → sendAudioChunks() flow
+    // No need to process audioBuffer here anymore
   }
   
   // Handle test commands from serial monitor
@@ -1440,6 +1357,11 @@ void loop() {
       Serial.printf("📥 Received command: %s\n", command.c_str());
       handleTestCommand(command);
     }
+  }
+  
+  // Audio streaming management
+  if (isAudioStreaming && meshNetworkActive) {
+    sendAudioChunks();
   }
   
   // Mesh network management

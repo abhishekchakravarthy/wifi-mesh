@@ -12,7 +12,7 @@ import java.nio.ByteOrder
 class SimpleOpusEncoder {
     companion object {
         private const val TAG = "SimpleOpusEncoder"
-        private const val FRAME_SIZE = 160 // 10ms at 16kHz
+        private const val FRAME_SIZE = 100 // 6.25ms at 16kHz
         private const val MAX_FRAME_SIZE = 6 * 960
     }
 
