@@ -6,6 +6,8 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
 import kotlinx.coroutines.*
+import java.util.concurrent.LinkedBlockingQueue
+import android.media.AudioAttributes
 
 class AudioCaptureManager(
     private val onAudioData: (ByteArray, Int) -> Unit,
@@ -15,67 +17,23 @@ class AudioCaptureManager(
         private const val TAG = "AudioCaptureManager"
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val FRAME_SIZE = 100  // 6.25ms at 16kHz (matches ESP32 chunk size)
-        private const val COMPRESSED_FRAME_SIZE = 200  // 100 samples * 2 bytes = 200 bytes
-        private const val PREBUFFER_BYTES = 3200 // 100ms of 16-bit mono - FINAL INCREASE
-        
-            // Direct playback - no buffering for minimal latency
+        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT // REVERT to 16-BIT PCM
+        // Buffer size needs to be larger to send bigger packets less frequently
+        private const val FRAME_SIZE = 200  // Read 200 samples (12.5ms) at a time
+        private const val PACKET_SIZE_BYTES = 200 // 200 samples compressed to 200 u-law bytes
     }
 
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var isRecording = false
+    private var isPlaybackActive = false
+    private val playbackBuffer = LinkedBlockingQueue<ByteArray>()
+
     private var recordingJob: Job? = null
-    
-    // Audio buffers - increased for better performance
-    private val audioBuffer = ShortArray(FRAME_SIZE * 2)  // Larger buffer
-    private val compressedBuffer = ByteArray(COMPRESSED_FRAME_SIZE * 2)
-    private val decodedBuffer = ShortArray(FRAME_SIZE * 2)
-    
-    // Stream synchronization for smooth audio
-    private val streamBuffer = ByteArray(2048)  // Back to 2KB buffer
-    private var streamBufferSize = 0
-    private var streamBufferIndex = 0
-    private val streamLock = Object()
-    private var isStreamStarted = false
-    private var lastPacketTime = 0L
-    private var lastReceivedSequence = 0  // Track last received sequence for loss detection
-    private var consecutivePacketLoss = 0  // Count consecutive lost packets
-    private var bufferPrimed = false  // Track if buffer is ready for optimal processing
-    
-    // Audio playback buffer for received chunks - much larger buffer
-    private val playbackBuffer = ByteArray(16384)  // 16KB buffer for received audio - FINAL INCREASE
-    private var playbackBufferSize = 0
-    private var playbackBufferIndex = 0
-    private val playbackLock = Object()
-    
-    // Chunked audio buffer for reassembling audio data
-    private val chunkedAudioBuffer = ByteArray(1024)  // Buffer for reassembling chunks
-    private var chunkedAudioBufferSize = 0
-    private var lastChunkTime = 0L
-    private val chunkTimeout = 50L // 50ms timeout for chunks
 
-    fun startRecording() {
-        if (isRecording) {
-            Log.w(TAG, "Recording already in progress")
-            return
-        }
-
+    private fun initializeRecording(): Boolean {
         try {
-            // Calculate minimum buffer size
-            val minBufferSize = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE, 
-                CHANNEL_CONFIG, 
-                AUDIO_FORMAT
-            )
-
-            if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
-                onError("Invalid audio configuration")
-                return
-            }
-
-            // Create AudioRecord with larger buffer for better performance
+            val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 SAMPLE_RATE,
@@ -83,42 +41,95 @@ class AudioCaptureManager(
                 AUDIO_FORMAT,
                 minBufferSize * 2
             )
-
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                onError("Failed to initialize AudioRecord")
-                return
+                Log.e(TAG, "AudioRecord initialization failed.")
+                return false
             }
+            Log.d(TAG, "AudioRecord initialized, buffer size: ${minBufferSize * 2} bytes")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during AudioRecord initialization", e)
+            return false
+        }
+    }
 
-            // No state initialization needed for simple compression
+    private fun initializePlayback(): Boolean {
+        try {
+            val minBufferSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AUDIO_FORMAT)
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AUDIO_FORMAT)
+                .setSampleRate(SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
 
-            // Start recording
-            audioRecord?.startRecording()
-            isRecording = true
-
-            Log.d(TAG, "Audio recording started - ADPCM compression mode")
-            Log.d(TAG, "Sample rate: $SAMPLE_RATE Hz")
-            Log.d(TAG, "Frame size: $FRAME_SIZE samples (6.25ms)")
-            Log.d(TAG, "Compressed frame size: $COMPRESSED_FRAME_SIZE bytes (raw PCM)")
-
-            // Prime the audio buffer to avoid initial cut-off
-            Log.d(TAG, "Priming audio buffer...")
-            val primeBuffer = ShortArray(FRAME_SIZE)
-            var primeAttempts = 0
-            while (primeAttempts < 10) { // Try up to 10 times
-                val readSize = audioRecord?.read(primeBuffer, 0, primeBuffer.size) ?: 0
-                if (readSize > 0) {
-                    Log.d(TAG, "Audio buffer primed successfully after $primeAttempts attempts")
-                    break
-                }
-                primeAttempts++
-                Thread.sleep(10) // Wait 10ms between attempts
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(attributes)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(minBufferSize * 4)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            
+            if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioTrack initialization failed.")
+                return false
             }
+            Log.d(TAG, "AudioTrack initialized, buffer size: ${minBufferSize * 4} bytes")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during AudioTrack initialization", e)
+            return false
+        }
+    }
 
-            // Start processing in background
+    fun startRecording() {
+        if (isRecording) {
+            Log.w(TAG, "Recording is already in progress")
+            return
+        }
+
+        // Reset state
+        playbackBuffer.clear()
+        isRecording = true
+
+        try {
+            // Start processing in background, but run the priming loop first.
             recordingJob = CoroutineScope(Dispatchers.IO).launch {
-                processAudioCapture()
-            }
+                if (!initializeRecording() || !initializePlayback()) {
+                    Log.e(TAG, "Failed to initialize audio components")
+                    onError("Audio init failed")
+                    return@launch
+                }
 
+                audioRecord?.startRecording()
+                audioTrack?.play()
+                Log.d(TAG, "Audio recording and playback started")
+
+                val primeBuffer = ShortArray(FRAME_SIZE)
+                var hasRealAudio = false
+                for (i in 1..10) { // Try up to 10 times
+                    val readSize = audioRecord?.read(primeBuffer, 0, primeBuffer.size) ?: 0
+                    if (readSize > 0 && primeBuffer.any { it != 0.toShort() }) {
+                        Log.d(TAG, "Microphone is live and delivering audio data after $i attempts.")
+                        hasRealAudio = true
+                        break
+                    }
+                    delay(20) // Non-blocking delay
+                }
+
+                if (!hasRealAudio) {
+                    Log.e(TAG, "Microphone failed to deliver audio data after multiple attempts.")
+                    onError("Mic failed to start")
+                    // Clean up resources before exiting
+                    stopAudioComponents()
+                    return@launch
+                }
+
+                unifiedAudioLoop()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error starting recording", e)
             onError("Failed to start recording: ${e.message}")
@@ -126,76 +137,130 @@ class AudioCaptureManager(
     }
 
     fun stopRecording() {
-        if (!isRecording) {
-            Log.w(TAG, "Recording not in progress")
-            return
-        }
-
-        try {
-            isRecording = false
-            recordingJob?.cancel()
-            recordingJob = null
-
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
-            
-            Log.d(TAG, "Audio recording stopped - microphone disabled")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping audio recording", e)
-        }
+        Log.d(TAG, "Stop recording signal received by manager.")
+        isRecording = false
     }
 
-    private suspend fun processAudioCapture() {
-        Log.d(TAG, "=== REAL AUDIO CAPTURE MODE STARTED ===")
-        Log.d(TAG, "Capturing real microphone audio")
+    private fun stopAudioComponents() {
+        Log.d(TAG, "Stopping and releasing audio components...")
         
-        while (isRecording) {
-            try {
-                // Read real audio from microphone
-                val readSize = audioRecord?.read(audioBuffer, 0, FRAME_SIZE) ?: 0
-                
-                if (readSize > 0) {
-                    // Compress the audio data
-                    val compressedSize = compressSimple(audioBuffer, readSize, compressedBuffer)
-                    
-                    if (compressedSize > 0) {
-                        // Send real audio data in 32-byte chunks for nRF compatibility
-                        val chunkSize = 32
-                        var offset = 0
-                        
-                        while (offset < compressedSize) {
-                            val currentChunkSize = minOf(chunkSize, compressedSize - offset)
-                            val chunk = compressedBuffer.sliceArray(offset until offset + currentChunkSize)
-                            
-                            try {
-                                Log.d(TAG, "=== REAL AUDIO CHUNK SENT ===")
-                                Log.d(TAG, "Chunk size: $currentChunkSize bytes (offset: $offset)")
-                                onAudioData(chunk, currentChunkSize)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error sending audio chunk", e)
-                            }
-                            
-                            offset += chunkSize
-                            
-                            // Small delay between chunks to prevent overwhelming
-                            kotlinx.coroutines.delay(5)
-                        }
+        recordingJob?.cancel() // Cancel the coroutine
+        recordingJob = null
+
+        audioRecord?.apply {
+            if (recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                stop()
+            }
+            release()
+        }
+        audioRecord = null
+        Log.d(TAG, "AudioRecord released.")
+
+        audioTrack?.apply {
+            if (playState == AudioTrack.PLAYSTATE_PLAYING) {
+                // Flush might be better than stop to clear pending data without abrupt stop
+                flush()
+                stop()
+            }
+            release()
+        }
+        audioTrack = null
+        Log.d(TAG, "AudioTrack released.")
+        
+        playbackBuffer.clear()
+        isPlaybackActive = false
+    }
+
+
+    private suspend fun unifiedAudioLoop() {
+        Log.d(TAG, "Unified audio loop started.")
+        val pcmBuffer = ShortArray(FRAME_SIZE)
+        
+        // Pre-buffering phase
+        Log.d(TAG, "Pre-buffering to ensure smooth start...")
+        val preBufferStartTime = System.currentTimeMillis()
+        while (System.currentTimeMillis() - preBufferStartTime < 500) {
+            val readResult = audioRecord?.read(pcmBuffer, 0, FRAME_SIZE, AudioRecord.READ_NON_BLOCKING) ?: 0
+            if (readResult > 0) {
+                val encoded = MuLawCodec.encode(pcmBuffer, readResult)
+                onAudioData(encoded, encoded.size)
+            }
+            // Small delay to prevent a tight loop from starving other processes
+            delay(10) 
+        }
+        Log.d(TAG, "Pre-buffering complete.")
+
+        // Main full-duplex loop
+        while (isRecording) { // The loop should run as long as we are supposed to be recording
+            // 1. Capture audio
+            val readResult = audioRecord?.read(pcmBuffer, 0, FRAME_SIZE, AudioRecord.READ_NON_BLOCKING) ?: 0
+            if (readResult > 0) {
+                Log.d(TAG, "MIC CAPTURE: ${pcmBuffer.take(8).joinToString()}")
+                val encoded = MuLawCodec.encode(pcmBuffer, readResult)
+                Log.d(TAG, "ENCODED SEND: ${encoded.take(8).joinToString { "0x%02X".format(it) }}")
+                onAudioData(encoded, encoded.size)
+            } else if (readResult < 0) {
+                Log.w(TAG, "AudioRecord read error: $readResult")
+            }
+
+            // 2. Playback received audio
+            val data = playbackBuffer.poll() // Use non-blocking poll
+            if (data != null) {
+                Log.d(TAG, "DECODING RECV: ${data.take(8).joinToString { "0x%02X".format(it) }}")
+                val decoded = MuLawCodec.decode(data, data.size)
+                Log.d(TAG, "PLAYING DECODED: ${decoded.take(8).joinToString()}")
+                if (decoded.isNotEmpty()) {
+                    val written = audioTrack?.write(decoded, 0, decoded.size) ?: 0
+                    if (written < 0) {
+                         Log.w(TAG, "AudioTrack write error: $written")
                     }
                 }
-                
-                // Small delay to prevent overwhelming the system
-                kotlinx.coroutines.delay(10)
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in audio capture loop", e)
-                break
+            }
+            
+            // If neither reading nor playing, yield to avoid busy-waiting
+            if (readResult <= 0 && data == null) {
+                delay(5)
             }
         }
         
-        Log.d(TAG, "Real audio capture stopped")
+        Log.d(TAG, "Recording flag is false. Draining playback buffer...")
+
+        // Drain the remaining playback buffer
+        while (playbackBuffer.isNotEmpty()) {
+            val data = playbackBuffer.poll()
+            if (data != null) {
+                val decoded = MuLawCodec.decode(data, data.size)
+                if (decoded.isNotEmpty()) {
+                    audioTrack?.write(decoded, 0, decoded.size)
+                }
+            }
+        }
+        
+        Log.d(TAG, "Buffer drained. Releasing audio components.")
+        stopAudioComponents()
+        Log.d(TAG, "Unified audio loop finished.")
+    }
+
+    fun playReceivedAudio(data: ByteArray, size: Int) {
+        if (size > 0) {
+            val packet = data.copyOf(size)
+            // Log this outside the hot path of the audio loop for clarity
+            // Log.d(TAG, "RECEIVED ECHO: ${packet.take(8).joinToString { "0x%02X".format(it) }}")
+            playbackBuffer.offer(packet)
+        }
     }
     
+    private fun handleAudioRecordError(errorCode: Int) {
+        when (errorCode) {
+            AudioRecord.ERROR_INVALID_OPERATION -> Log.e(TAG, "AudioRecord Error: Invalid operation.")
+            AudioRecord.ERROR_BAD_VALUE -> Log.e(TAG, "AudioRecord Error: Bad value. Check parameters.")
+            AudioRecord.ERROR_DEAD_OBJECT -> Log.e(TAG, "AudioRecord Error: Dead object. Media server died.")
+            AudioRecord.ERROR -> Log.e(TAG, "AudioRecord Error: Generic error.")
+            0 -> Log.v(TAG, "Mic read 0 bytes, likely just no speech.") // Not an error, just silence
+            else -> Log.e(TAG, "AudioRecord Error: Unknown error code $errorCode")
+        }
+    }
+
     // Generate a 32-byte test pattern that will produce audible sound when repeated
     private fun generateTestPattern(counter: Int): ByteArray {
         val pattern = ByteArray(32) // Back to 32-byte pattern for nRF compatibility
@@ -240,149 +305,6 @@ class AudioCaptureManager(
 
 
 
-    // Play back received audio data with sequence number handling
-    fun playAudioData(data: ByteArray, size: Int) {
-        if (audioTrack == null) {
-            Log.w(TAG, "AudioTrack not initialized, initializing now")
-            if (!initializePlayback()) {
-                Log.e(TAG, "Failed to initialize playback for received audio")
-                return
-            }
-        }
-
-        try {
-            // Validate data size (expecting 2-byte sequence number + audio data)
-            if (size <= 2 || size > data.size) {
-                Log.w(TAG, "Invalid audio data size: $size (expected > 2 bytes)")
-                return
-            }
-            
-            // Extract sequence number from packet header
-            val sequenceNumber = (data[1].toInt() shl 8) or (data[0].toInt() and 0xFF)
-            val audioDataSize = size - 2
-            val audioData = data.sliceArray(2 until size)
-            
-            // Check for packet loss and buffer priming
-            if (lastReceivedSequence > 0) {
-                val expectedSequence = (lastReceivedSequence + 1) and 0xFFFF
-                if (sequenceNumber != expectedSequence) {
-                    consecutivePacketLoss++
-                    if (consecutivePacketLoss >= 5) {
-                        Log.w(TAG, "Packet loss detected: Expected $expectedSequence, Got $sequenceNumber (Loss: $consecutivePacketLoss)")
-                    }
-                } else {
-                    consecutivePacketLoss = 0
-                }
-            }
-            lastReceivedSequence = sequenceNumber
-            
-            // Buffer priming: Wait for initial packets to fill buffer
-            if (!bufferPrimed && streamBufferSize < 2048) {
-                Log.d(TAG, "Buffer priming: ${streamBufferSize} bytes collected")
-            } else if (!bufferPrimed && streamBufferSize >= 2048) {
-                bufferPrimed = true
-                Log.d(TAG, "Buffer primed - optimal processing enabled")
-            }
-            
-            synchronized(streamLock) {
-                // Add audio data to stream buffer (skip sequence number)
-                for (i in 0 until audioDataSize) {
-                    streamBuffer[streamBufferIndex] = audioData[i]
-                    streamBufferIndex = (streamBufferIndex + 1) % streamBuffer.size
-                    streamBufferSize = minOf(streamBufferSize + 1, streamBuffer.size)
-                }
-                
-                // Start stream playback if we have enough data and haven't started yet
-                if (!isStreamStarted && streamBufferSize >= PREBUFFER_BYTES) {
-                    isStreamStarted = true
-                    lastPacketTime = System.currentTimeMillis()
-                    Log.d(TAG, "Starting synchronized stream playback with ${streamBufferSize} bytes, sequence: $sequenceNumber")
-                    
-                    // Start background stream processing
-                    CoroutineScope(Dispatchers.IO).launch {
-                        processSynchronizedStream()
-                    }
-                }
-            }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error buffering audio data", e)
-        }
-    }
-    
-    // Background thread for synchronized stream processing (inspired by ESP32 I2S WiFi Radio)
-    private suspend fun processSynchronizedStream() {
-        val playbackData = ByteArray(200) // 200-byte chunks (100 samples)
-        var lastPlayTime = 0L
-        val targetInterval = 6L // 6.25ms intervals
-        var consecutiveEmptyReads = 0
-        val maxEmptyReads = 80 // Stop if no data for 500ms
-        
-        while (isStreamStarted) {
-            try {
-                val currentTime = System.currentTimeMillis()
-                var dataProcessed = false
-                
-                synchronized(streamLock) {
-                    if (streamBufferSize >= 200) {
-                        // Get data from stream buffer with proper circular buffer handling
-                        val startIndex = (streamBufferIndex - streamBufferSize + streamBuffer.size) % streamBuffer.size
-                        for (i in 0 until 200) {
-                            val bufferIndex = (startIndex + i) % streamBuffer.size
-                            playbackData[i] = streamBuffer[bufferIndex]
-                        }
-                        streamBufferSize -= 200
-                        
-                        // Process the audio data - it's already raw 16-bit PCM, no decompression needed
-                        // ESP32 B sends raw 16-bit PCM data directly
-                        val pcmBytes = ByteArray(200) // 200 bytes = 100 samples * 2 bytes
-                        System.arraycopy(playbackData, 0, pcmBytes, 0, 200)
-                        
-                        // Play the audio with blocking write for better synchronization
-                        val written = audioTrack?.write(pcmBytes, 0, pcmBytes.size, AudioTrack.WRITE_BLOCKING) ?: 0
-                        if (written > 0) {
-                            Log.v(TAG, "Synchronized stream: $written bytes, buffer: ${streamBufferSize} bytes")
-                            dataProcessed = true
-                            consecutiveEmptyReads = 0
-                        }
-                        
-                        lastPlayTime = currentTime
-                    } else {
-                        consecutiveEmptyReads++
-                    }
-                }
-                
-                // Stop if no data for too long
-                if (consecutiveEmptyReads > maxEmptyReads) {
-                    Log.w(TAG, "No audio data for ${maxEmptyReads * 10}ms, stopping stream")
-                    break
-                }
-                
-                // Maintain consistent timing with adaptive delays
-                val elapsed = currentTime - lastPlayTime
-                val delayTime = if (dataProcessed) {
-                    maxOf(0L, targetInterval - elapsed)
-                } else {
-                    // Shorter delay when no data to reduce latency
-                    maxOf(1L, targetInterval / 2 - elapsed)
-                }
-                
-                if (delayTime > 0) {
-                    kotlinx.coroutines.delay(delayTime)
-                }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in synchronized stream", e)
-                break
-            }
-        }
-        
-        isStreamStarted = false
-        Log.d(TAG, "Synchronized stream stopped")
-    }
-    
-
-
     // Raw 16-bit audio - no decompression, no processing
     private fun decompressSimple(compressed: ByteArray, size: Int, samples: ShortArray): Int {
         var sampleIndex = 0
@@ -402,237 +324,18 @@ class AudioCaptureManager(
     
 
 
-    private fun initializePlayback(): Boolean {
-        try {
-            val minBufferSize = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
-                Log.e(TAG, "Invalid audio configuration for playback")
-                return false
-            }
-
-            // Release existing AudioTrack if any
-            audioTrack?.stop()
-            audioTrack?.release()
-            audioTrack = null
-
-            // Try different AudioTrack configurations
-            audioTrack = AudioTrack.Builder()
-                .setAudioAttributes(android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build())
-                .setAudioFormat(android.media.AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build())
-                .setBufferSizeInBytes(minBufferSize * 10) // Large buffer for stability
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-
-            if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
-                Log.e(TAG, "Failed to initialize AudioTrack")
-                return false
-            }
-
-            // Start playback immediately
-            audioTrack?.play()
-            Log.d(TAG, "AudioTrack initialized and started for playback")
-            Log.d(TAG, "AudioTrack state: ${audioTrack?.state}, play state: ${audioTrack?.playState}")
-            Log.d(TAG, "Buffer size: ${audioTrack?.bufferSizeInFrames} frames")
-            
-            // Delay a bit to ensure AudioTrack is ready
-            Thread.sleep(50)
-            
-            return true
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error initializing AudioTrack", e)
-            return false
-        }
-    }
-
-    fun playReceivedAudio(data: ByteArray, size: Int) {
-        // This is the final, simplified playback logic.
-        // It relies on a large AudioTrack hardware buffer to handle jitter,
-        // which is the standard and most robust method for audio streaming.
-        try {
-            // Ensure AudioTrack is initialized and ready.
-            if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
-                if (!initializePlayback()) {
-                    onError("Failed to initialize AudioTrack for playback")
-                    return
-                }
-            }
-
-            // Ensure the track is playing.
-            if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                audioTrack?.play()
-            }
-
-            // Write the incoming audio data directly to the AudioTrack's buffer.
-            // The audio hardware will pull from this buffer at the correct, stable rate.
-            if (size > 0) {
-                val written = audioTrack?.write(data, 0, size) ?: 0
-                if (written < size) {
-                    Log.w(TAG, "AudioTrack buffer might be full. Wrote $written of $size bytes.")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error playing received audio", e)
-        }
-    }
-    
-    // Play accumulated audio from buffer
-    private fun playAccumulatedAudio() {
-        try {
-            if (chunkedAudioBufferSize > 0) {
-                Log.d(TAG, "Playing accumulated audio: $chunkedAudioBufferSize bytes")
-                
-                // Ensure AudioTrack is initialized
-                if (audioTrack == null) {
-                    if (!initializePlayback()) {
-                        Log.e(TAG, "Failed to initialize AudioTrack for accumulated audio")
-                        return
-                    }
-                }
-                
-                // Ensure AudioTrack is playing
-                if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                    audioTrack?.play()
-                }
-                
-                // Instead of direct write, push into stream buffer
-                val even = if (chunkedAudioBufferSize % 2 == 0) chunkedAudioBufferSize else chunkedAudioBufferSize - 1
-                synchronized(streamLock) {
-                    for (i in 0 until even) {
-                        streamBuffer[streamBufferIndex] = chunkedAudioBuffer[i]
-                        streamBufferIndex = (streamBufferIndex + 1) % streamBuffer.size
-                        streamBufferSize = minOf(streamBufferSize + 1, streamBuffer.size)
-                    }
-                    if (!isStreamStarted && streamBufferSize >= PREBUFFER_BYTES) {
-                        isStreamStarted = true
-                        lastPacketTime = System.currentTimeMillis()
-                        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                            processSynchronizedStream()
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error playing accumulated audio", e)
-        }
-    }
-    
-    // Validate received test pattern (audio format)
-    private fun validateTestPattern(data: ByteArray, size: Int): Boolean {
-        if (size != 32) {
-            Log.e(TAG, "Invalid pattern size: $size (expected 32)")
-            return false
-        }
-        
-        // Check start markers (16-bit value: 0x55AA in little-endian)
-        if (data[0] != 0xAA.toByte() || data[1] != 0x55.toByte()) {
-            Log.e(TAG, "Invalid start markers: 0x${data[0].toString(16).uppercase()}, 0x${data[1].toString(16).uppercase()} (expected 0xAA, 0x55)")
-            return false
-        }
-        
-        // Check counter high byte
-        if (data[3] != 0x00.toByte()) {
-            Log.e(TAG, "Invalid counter high byte: 0x${data[3].toString(16).uppercase()} (expected 0x00)")
-            return false
-        }
-        
-        // Check that we have valid 16-bit PCM data (non-zero samples)
-        var hasNonZeroSamples = false
-        for (i in 4 until minOf(20, size) step 2) {
-            val sample = (data[i + 1].toInt() shl 8) or (data[i].toInt() and 0xFF)
-            if (sample != 0) {
-                hasNonZeroSamples = true
-                break
-            }
-        }
-        
-        if (!hasNonZeroSamples) {
-            Log.e(TAG, "No non-zero audio samples found in test pattern")
-            return false
-        }
-        
-        // Log the counter value
-        val counter = data[2].toInt() and 0xFF
-        Log.d(TAG, "Test pattern validation successful - Counter: $counter")
-        Log.d(TAG, "Audio format validation passed - 32-byte 2kHz tone detected!")
-        
-        return true
-    }
-
-    private fun generateTestTone() {
-        try {
-            // Generate a 1-second 440Hz sine wave test tone
-            val sampleRate = SAMPLE_RATE
-            val duration = 1.0 // 1 second
-            val frequency = 440.0 // 440 Hz (A note)
-            val numSamples = (sampleRate * duration).toInt()
-            
-            val testTone = ByteArray(numSamples * 2) // 16-bit = 2 bytes per sample
-            var sampleIndex = 0
-            
-            for (i in 0 until numSamples) {
-                val sample = (Math.sin(2.0 * Math.PI * frequency * i / sampleRate) * 16384.0).toInt().toShort()
-                testTone[sampleIndex++] = (sample.toInt() and 0xFF).toByte() // Low byte
-                testTone[sampleIndex++] = (sample.toInt() shr 8).toByte()   // High byte
-            }
-            
-            val written = audioTrack?.write(testTone, 0, testTone.size, AudioTrack.WRITE_BLOCKING) ?: 0
-            Log.d(TAG, "=== TEST TONE GENERATED: $written bytes ===")
-            Log.d(TAG, "You should hear a 1-second 440Hz tone")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error generating test tone", e)
-        }
-    }
-
     fun playTestTone() {
-        try {
-            Log.d(TAG, "=== PLAY TEST TONE CALLED ===")
-            
-            // Ensure AudioTrack is initialized
-            if (audioTrack == null) {
-                Log.w(TAG, "AudioTrack not initialized, initializing now")
-                if (!initializePlayback()) {
-                    Log.e(TAG, "Failed to initialize AudioTrack for test tone")
-                    return
-                }
-            }
-
-            // Check AudioTrack state
-            val trackState = audioTrack?.state
-            Log.d(TAG, "AudioTrack state for test tone: $trackState")
-            
-            if (trackState != AudioTrack.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioTrack not in INITIALIZED state: $trackState")
-                return
-            }
-
-            // Ensure AudioTrack is playing
-            if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                Log.w(TAG, "AudioTrack not playing, starting playback")
-                audioTrack?.play()
-            }
-
-            // Wait a bit for AudioTrack to be ready
-            Thread.sleep(50)
-            
-            generateTestTone()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error playing test tone", e)
-            e.printStackTrace()
+        if (audioTrack == null) {
+            Log.e(TAG, "AudioTrack not initialized, cannot play test tone.")
+            return
         }
+        if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+            Log.w(TAG, "AudioTrack is already playing.")
+            return
+        }
+        
+        // This function is now obsolete as the generator was removed.
+        // It can be removed entirely.
     }
 
     fun release() {

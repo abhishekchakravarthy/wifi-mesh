@@ -6,6 +6,42 @@ A multi-device audio communication system (intercom) using ESP32-S3 devices with
 Phone A <-> BLE <-> ESP32 A (Coordinator) <-> ESP-NOW Mesh <-> ESP32 B (Client) <-> BLE <-> Phone B
 ```
 
+## 🎶 Live BLE Audio Echo Pipeline (Phone <-> ESP32)
+
+As a core milestone, a full-duplex, live audio echo feature has been implemented to test the real-time audio capabilities of the system. This pipeline serves as the foundation for the larger mesh network.
+
+```mermaid
+sequenceDiagram
+    participant Phone Mic
+    participant Android App
+    participant ESP32
+    participant Phone Speaker
+
+    loop Live Audio Stream
+        Phone Mic->>Android App: Capture 16-bit PCM Audio (16kHz, Mono)
+        Android App->>Android App: Encode with µ-law Compression
+        Android App->>ESP32: Send 200-byte µ-law packet via BLE
+        ESP32->>ESP32: Echo packet immediately in onWrite callback
+        ESP32->>Android App: Notify with echoed µ-law packet
+        Android App->>Android App: Decode µ-law packet to 16-bit PCM
+        Android App->>Phone Speaker: Play decoded audio via AudioTrack
+    end
+```
+
+### **Android App Components**
+- **Role**: BLE Client.
+- **Audio Capture**: Uses `AudioRecord` to capture 16kHz, 16-bit mono PCM audio from the device microphone. A priming loop ensures the mic is delivering real audio data before streaming begins.
+- **Compression**: The raw PCM audio is compressed on-the-fly to 8-bit µ-law format using a custom `MuLawCodec`. This crucial step halves the data rate, making it suitable for the limited bandwidth of BLE.
+- **BLE Communication**: Manages sending the µ-law packets and receiving the echoed packets via a single BLE characteristic.
+- **Decompression & Playback**: The echoed µ-law packets are decoded back into 16-bit PCM. An `AudioTrack` instance, configured for low-latency voice communication, plays the audio.
+- **Buffering**: A jitter buffer (`LinkedBlockingQueue`) is used to smooth out playback, absorbing network timing variations and preventing audio glitches.
+- **Concurrency**: The entire process—capture, encoding, sending, receiving, decoding, and playback—is managed within a single, unified background coroutine (`unifiedAudioLoop`) to eliminate race conditions and ensure stable, full-duplex operation.
+
+### **ESP32 Firmware Components**
+- **Role**: BLE Server.
+- **Echo Logic**: The firmware implements an extremely lightweight "mirror" echo. Upon receiving data in the `onWrite` characteristic callback, it immediately uses that same data to call `setValue()` and `notify()`, sending it right back to the Android client.
+- **Efficiency**: No significant buffering, processing, or task switching occurs on the ESP32 for the echo. This makes the turnaround near-instantaneous and adds minimal latency to the audio round-trip.
+
 ## 🏗️ System Architecture
 
 ### **ESP32 A (Coordinator)**

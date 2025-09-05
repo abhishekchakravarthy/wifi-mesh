@@ -799,6 +799,30 @@ class MyCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
+// Callback class for characteristic events
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        size_t len = value.length();
+
+        if (len > 0) {
+            if (len == 4 && value == "BEEP") {
+                Serial.println("Received 'BEEP' command, triggering test tone.");
+                sendBeepOnce();
+            } else {
+                Serial.printf("ECHO RECV: len=%d, data=", len);
+                for (int i=0; i<min((size_t)8, len); i++) {
+                    Serial.printf("%02X ", (uint8_t)value[i]);
+                }
+                Serial.println();
+                
+                pAudioCharacteristic->setValue((uint8_t*)value.data(), len);
+                pAudioCharacteristic->notify();
+            }
+        }
+    }
+};
+
 // Audio streaming constants for ESP-NOW - FIT ESP-NOW LIMITS
 #define AUDIO_CHUNK_SIZE 200  // 100 samples * 2 bytes = 200 bytes (fits in 250B ESP-NOW limit)
 #define AUDIO_SAMPLE_RATE 16000  // Match Android: 16kHz
@@ -929,77 +953,62 @@ void calculateAudioStats(const uint8_t* data, int length, uint16_t& minVal, uint
   avgVal = 128;
 }
 
-// Send a single 240-byte 1kHz 8-bit beep frame via optimized A: chunk
+// u-law encoding function for an audio sample
+uint8_t linearToUlaw(int16_t pcm_val) {
+    int16_t mask;
+    int16_t seg;
+    uint8_t uval;
+    pcm_val = pcm_val >> 2;
+    if (pcm_val < 0) {
+        pcm_val = -pcm_val;
+        mask = 0x7F;
+    } else {
+        mask = 0xFF;
+    }
+    if (pcm_val > 8158) pcm_val = 8158;
+    pcm_val += 133;
+
+    seg = 0;
+    while( pcm_val > ( (33<<(seg+1)) - 33 ) ){
+        seg++;
+    }
+
+    uval = (uint8_t)(((seg << 4) | ((pcm_val - ( (33<<(seg)) - 33 )) >> (seg + 1))));
+    return (uval ^ mask);
+}
+
+
 void sendBeepOnce() {
-  if (meshDeviceCount == 0 && !deviceConnected) {
-    Serial.println("⚠️ No mesh or BLE devices connected, cannot send beep");
-    return;
-  }
-  // Send a longer beep (~2000 ms)
-  const int beepMs = 5000;
-  const int totalFrames = max(1, (int)(beepMs / 6.25)); // 100 samples @16kHz = 6.25ms/frame
-  
-  // Precompute one 100-sample 1kHz sine frame (16-bit PCM, 16kHz sample rate)
-  static uint8_t sineFrame[AUDIO_CHUNK_SIZE]; // 200 bytes for 100 samples × 2 bytes
+  Serial.println("--- Starting 5-second beep test (u-law compressed) ---");
+  const int loopCount = 400; // 400 loops * 12.5ms/loop = 5000ms = 5s
+  const int samplesPerLoop = 200;
+  static int16_t sineFrame[samplesPerLoop];
   static bool sineInit = false;
   if (!sineInit) {
-    for (int n = 0; n < 100; n++) { // 100 samples for 200 bytes
-      float t = (float)n / 16000.0f;
-      float s = sinf(2.0f * 3.1415926f * 1000.0f * t);
-      int16_t sample = (int16_t)(s * 16383.0f); // 16-bit signed sample
-      
-      // Convert to little-endian 16-bit PCM
-      sineFrame[n * 2] = (uint8_t)(sample & 0xFF);        // Low byte
-      sineFrame[n * 2 + 1] = (uint8_t)((sample >> 8) & 0xFF); // High byte
+    for (int i = 0; i < samplesPerLoop; i++) {
+        // 1kHz sine wave at 16kHz sample rate
+        sineFrame[i] = (int16_t)(sin(2 * PI * 1000.0 * i / AUDIO_SAMPLE_RATE) * 16384.0);
     }
     sineInit = true;
   }
 
-  const TickType_t xFrequency = pdMS_TO_TICKS(6); // Use a 6ms tick delay, the closest to 6.25ms
+  const TickType_t xFrequency = pdMS_TO_TICKS(12); // Paced for ~12.5ms
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  for (int f = 0; f < totalFrames; f++) {
-    uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
-    int rawSize = compressAudioData(sineFrame, AUDIO_CHUNK_SIZE, rawBuffer);
-    uint16_t minVal, maxVal; uint32_t avgVal;
-    calculateAudioStats(sineFrame, AUDIO_CHUNK_SIZE, minVal, maxVal, avgVal);
+  for (int f = 0; f < loopCount; f++) {
+    uint8_t ulawBuffer[samplesPerLoop];
+    for (int i = 0; i < samplesPerLoop; i++) {
+        ulawBuffer[i] = linearToUlaw(sineFrame[i]);
+    }
 
-    char messageBuffer[300];
-    int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
-                              "P:%d:%d:%d:%d:%d:%d:%d:%d",
-                              audioSequenceNumber++, f, totalFrames,
-                              millis(), AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE,
-                              minVal, maxVal);
-    // Ensure we do not exceed ESP-NOW 250B limit; size payload BEFORE copying
-    int maxTotal = 250;
-    int availableForData = maxTotal - messageLen - 1; // minus ':'
-    if (availableForData <= 0) {
-      vTaskDelayUntil(&xLastWakeTime, xFrequency); // Still delay to maintain timing
-      continue; // header too large, skip this frame
-    }
-    int toCopy = (rawSize < availableForData) ? rawSize : availableForData;
-    messageBuffer[messageLen++] = ':';
-    memcpy(messageBuffer + messageLen, rawBuffer, toCopy);
-    messageLen += toCopy;
-    if (meshDeviceCount > 0) {
-      for (int i = 0; i < meshDeviceCount; i++) {
-        if (meshDevices[i].isActive) {
-          esp_now_send(meshDevices[i].mac, (uint8_t*)messageBuffer, messageLen);
-        }
-      }
-    }
-    
-    // CRITICAL FIX: Also send beep to BLE characteristic for Android app
     if (deviceConnected && pAudioCharacteristic != nullptr) {
-      // Send raw beep audio data directly to BLE characteristic
-      pAudioCharacteristic->setValue(sineFrame, AUDIO_CHUNK_SIZE);
+      pAudioCharacteristic->setValue(ulawBuffer, samplesPerLoop);
       pAudioCharacteristic->notify();
-      Serial.printf("📱 Beep sent to BLE characteristic: %d bytes\n", AUDIO_CHUNK_SIZE);
     }
     
-    // Use a precise, cooperative RTOS delay to pace the loop
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
+  Serial.println("--- Beep test finished ---");
 }
 
 void sendAudioChunks() {
@@ -1295,7 +1304,7 @@ void setup() {
   pAudioCharacteristic->addDescriptor(new BLE2902());
   
   // Set callbacks
-  pAudioCharacteristic->setCallbacks(new MyCallbacks());
+  pAudioCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
   
   // Start the service
   pService->start();

@@ -50,6 +50,11 @@ class BLEAudioManager(
     private var bluetoothGatt: BluetoothGatt? = null
     private var audioCharacteristic: BluetoothGattCharacteristic? = null
     private var selectedDevice: BluetoothDevice? = null
+    private var negotiatedMtu: Int = 23
+    private var mtuReady: Boolean = false
+    private val frameSizeBytes: Int = 200
+    private val rxFrameBuffer = ByteArray(frameSizeBytes)
+    private var rxFrameIndex: Int = 0
     
     private val isScanning = AtomicBoolean(false)
     private val isConnected = AtomicBoolean(false)
@@ -112,6 +117,8 @@ class BLEAudioManager(
 
                     // Request MTU for better performance. Service discovery will be triggered in onMtuChanged.
                     Log.d(TAG, "Requesting MTU: $TARGET_MTU")
+                    mtuReady = false
+                    negotiatedMtu = 23
                     mainHandler.postDelayed({
                         gatt.requestMtu(TARGET_MTU)
                     }, 200) // Small delay for stability
@@ -142,6 +149,8 @@ class BLEAudioManager(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "=== MTU NEGOTIATION SUCCESSFUL ===")
                 Log.d(TAG, "New MTU size: $mtu")
+                negotiatedMtu = mtu
+                mtuReady = true
                 // Trigger service discovery after MTU negotiation is complete
                 Log.d(TAG, "Discovering services...")
                 mainHandler.postDelayed({
@@ -213,7 +222,7 @@ class BLEAudioManager(
             Log.d(TAG, "First 8 bytes: ${data.take(8).joinToString { "0x%02X".format(it) }}")
             
             if (size > 0) {
-                processReceivedChunk(data)
+                ingestAndEmitFrames(data)
             }
         }
         
@@ -370,70 +379,26 @@ class BLEAudioManager(
             bluetoothGatt?.discoverServices()
             return false
         }
-
         try {
-            Log.d(TAG, "=== SENDING AUDIO DATA (OLDER ANDROID COMPATIBLE) ===")
-            Log.d(TAG, "Data size: $size bytes")
-            
-            // For older Android devices, try multiple approaches
-            val approaches = listOf(
-                // Approach 1: Direct value setting
-                {
-                    Log.d(TAG, "Approach 1: Direct value setting")
-                    audioCharacteristic!!.setValue(data.copyOfRange(0, size))
-                    bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
-                },
-                // Approach 2: Set write type first
-                {
-                    Log.d(TAG, "Approach 2: Set write type first")
-                    audioCharacteristic!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    audioCharacteristic!!.setValue(data.copyOfRange(0, size))
-                    bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
-                },
-                // Approach 3: Use deprecated method for older devices
-                {
-                    Log.d(TAG, "Approach 3: Use deprecated method")
-                    try {
-                        @Suppress("DEPRECATION")
-                        audioCharacteristic!!.value = data.copyOfRange(0, size)
-                        @Suppress("DEPRECATION")
-                        bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Deprecated method failed: ${e.message}")
-                        false
-                    }
-                },
-                // Approach 4: Small chunk writing (for older devices with size limits)
-                {
-                    Log.d(TAG, "Approach 4: Small chunk writing")
-                    val chunkSize = minOf(20, size) // Older devices may have 20-byte limit
-                    val chunk = data.copyOfRange(0, chunkSize)
-                    audioCharacteristic!!.setValue(chunk)
-                    bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
+            Log.d(TAG, "=== SENDING AUDIO DATA (MTU-AWARE CHUNKING) ===")
+            Log.d(TAG, "Data size: $size bytes, negotiatedMtu=$negotiatedMtu, mtuReady=$mtuReady")
+            val maxPayload = kotlin.math.max(20, negotiatedMtu - 3)
+            audioCharacteristic!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            var offset = 0
+            while (offset < size) {
+                val end = kotlin.math.min(offset + kotlin.math.min(frameSizeBytes, maxPayload), size)
+                val slice = data.copyOfRange(offset, end)
+                audioCharacteristic!!.setValue(slice)
+                val ok = bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
+                if (!ok) {
+                    Log.e(TAG, "Chunk write failed at offset=$offset size=${end - offset}")
+                    return false
                 }
-            )
-            
-            for ((index, approach) in approaches.withIndex()) {
-                try {
-                    Log.d(TAG, "Trying approach ${index + 1}")
-                    val success = approach()
-                    if (success) {
-                        Log.d(TAG, "Approach ${index + 1} SUCCEEDED!")
-                        return true
-                    } else {
-                        Log.w(TAG, "Approach ${index + 1} failed")
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Approach ${index + 1} exception: ${e.message}")
-                }
-                
-                // Small delay between attempts
-                Thread.sleep(50)
+                offset = end
+                // Small pacing to avoid congesting the ATT queue
+                Thread.sleep(5)
             }
-            
-            Log.e(TAG, "All approaches failed")
-            return false
-            
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "=== AUDIO DATA SEND EXCEPTION ===")
             Log.e(TAG, "Exception during send: ${e.message}")
@@ -483,5 +448,22 @@ class BLEAudioManager(
         val payload = "BEEP".toByteArray()
         val ok = sendAudioData(payload, payload.size)
         return ok
+    }
+
+    // Reassemble incoming notification chunks into 200-byte frames before playback
+    private fun ingestAndEmitFrames(chunk: ByteArray) {
+        var offset = 0
+        while (offset < chunk.size) {
+            val copyLen = kotlin.math.min(frameSizeBytes - rxFrameIndex, chunk.size - offset)
+            System.arraycopy(chunk, offset, rxFrameBuffer, rxFrameIndex, copyLen)
+            rxFrameIndex += copyLen
+            offset += copyLen
+            if (rxFrameIndex == frameSizeBytes) {
+                val frame = rxFrameBuffer.copyOf(frameSizeBytes)
+                Log.d(TAG, "Emitting complete frame of $frameSizeBytes bytes to playback")
+                onAudioDataReceived(frame, frame.size)
+                rxFrameIndex = 0
+            }
+        }
     }
 }
