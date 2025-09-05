@@ -172,8 +172,8 @@ class MainActivity : AppCompatActivity() {
     private fun addDeviceToList(device: BluetoothDevice) {
         val deviceName = device.name ?: "Unknown"
         val description = when {
-            deviceName.contains("ESP32-A-Audio") -> "ESP32 A (Transmitter)"
-            deviceName.contains("ESP32-B-Audio") -> "ESP32 B (Receiver)"
+            deviceName.contains("ESP32S3_Audio_Server") -> "ESP32 A (Coordinator)"
+            deviceName.contains("ESP32S3_Audio_Client") -> "ESP32 B (Client)"
             else -> deviceName
         }
         

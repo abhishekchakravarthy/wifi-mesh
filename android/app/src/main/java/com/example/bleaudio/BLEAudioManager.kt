@@ -73,7 +73,8 @@ class BLEAudioManager(
             
             Log.d(TAG, "Scan result: $deviceName (${device.address})")
             
-            if (deviceName != null && deviceName.startsWith(DEVICE_NAME_PREFIX)) {
+            val hasService = result.scanRecord?.serviceUuids?.any { it.uuid.toString().equals(SERVICE_UUID, true) } == true
+            if (hasService || (deviceName != null && deviceName.startsWith(DEVICE_NAME_PREFIX))) {
                 Log.d(TAG, "Found ESP32 device: $deviceName")
                 
                 // Check if device already exists

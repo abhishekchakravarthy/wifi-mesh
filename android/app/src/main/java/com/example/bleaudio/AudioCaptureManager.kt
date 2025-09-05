@@ -30,6 +30,7 @@ class AudioCaptureManager(
     private val playbackBuffer = LinkedBlockingQueue<ByteArray>()
 
     private var recordingJob: Job? = null
+    private var playbackJob: Job? = null
 
     private fun initializeRecording(): Boolean {
         try {
@@ -247,6 +248,45 @@ class AudioCaptureManager(
             // Log this outside the hot path of the audio loop for clarity
             // Log.d(TAG, "RECEIVED ECHO: ${packet.take(8).joinToString { "0x%02X".format(it) }}")
             playbackBuffer.offer(packet)
+            // If not recording, ensure a playback-only loop is running to drain the buffer
+            if (!isRecording) {
+                startPlaybackOnlyIfNeeded()
+            }
+        }
+    }
+
+    private fun startPlaybackOnlyIfNeeded() {
+        if (isPlaybackActive) return
+        try {
+            if (audioTrack == null) {
+                if (!initializePlayback()) {
+                    Log.e(TAG, "Failed to initialize playback for playback-only mode")
+                    return
+                }
+            }
+            audioTrack?.play()
+            isPlaybackActive = true
+            playbackJob = CoroutineScope(Dispatchers.IO).launch {
+                Log.d(TAG, "Playback-only loop started")
+                while (isPlaybackActive) {
+                    val data = playbackBuffer.poll()
+                    if (data != null) {
+                        val decoded = MuLawCodec.decode(data, data.size)
+                        if (decoded.isNotEmpty()) {
+                            val written = audioTrack?.write(decoded, 0, decoded.size) ?: 0
+                            if (written < 0) {
+                                Log.w(TAG, "AudioTrack write error (playback-only): $written")
+                            }
+                        }
+                    } else {
+                        // No data; avoid busy spin
+                        delay(5)
+                    }
+                }
+                Log.d(TAG, "Playback-only loop stopped")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting playback-only loop", e)
         }
     }
     

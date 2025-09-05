@@ -1026,7 +1026,7 @@ void sendAudioChunks() {
   int chunksToSend = audioBufferIndex / AUDIO_CHUNK_SIZE;
   
   for (int chunk = 0; chunk < chunksToSend; chunk++) {
-        // RAW PCM: Direct audio data transmission
+        // Forward incoming BLE bytes (u-law) directly without conversion
         int startIndex = chunk * AUDIO_CHUNK_SIZE;
         uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
         int rawSize = compressAudioData(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, rawBuffer);
@@ -1041,7 +1041,7 @@ void sendAudioChunks() {
         int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
                                  "P:%d:%d:%d:%d:%d:%d:%d:%d",
                                  audioSequenceNumber++, chunk, chunksToSend,
-                                 millis(), AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE,
+                                 millis(), 16000, 8,
                                  minVal, maxVal);
         
         // Add raw PCM audio data directly
@@ -1078,13 +1078,7 @@ void sendAudioChunks() {
           }
         }
         
-        // CRITICAL FIX: Also send audio data to BLE characteristic for Android app
-        if (deviceConnected && pAudioCharacteristic != nullptr) {
-          // Send raw audio data directly to BLE characteristic
-          pAudioCharacteristic->setValue(rawBuffer, rawSize);
-          pAudioCharacteristic->notify();
-          Serial.printf("📱 Audio sent to BLE characteristic: %d bytes\n", rawSize);
-        }
+        // Do not locally notify back to Phone A; mesh forward only
     
     lastAudioChunk = millis();
     // NOTE: A hardcoded delay was removed from here. The main loop's delay provides general pacing.
@@ -1107,7 +1101,7 @@ void sendAudioChunks() {
     audioBufferIndex = 0;
   }
   
-  Serial.printf("🧹 Buffer cleared: %d bytes remaining, index reset to %d\n", remainingData, audioBufferIndex);
+ // Serial.printf("🧹 Buffer cleared: %d bytes remaining, index reset to %d\n", remainingData, audioBufferIndex);
 }
 
 // Enhanced test command handler for audio testing and data validation
@@ -1224,7 +1218,7 @@ void handleTestCommand(const String& command) {
     memset(audioBuffer, 0, AUDIO_BUFFER_SIZE);
     audioBufferIndex = 0;
     audioSequenceNumber = 0;
-    Serial.println("🧹 Audio buffer cleared");
+   // Serial.println("🧹 Audio buffer cleared");
   } else if (command == "send_beep") {
     sendBeepOnce();
   } else if (command.startsWith("send_ping:")) {
@@ -1304,7 +1298,8 @@ void setup() {
   pAudioCharacteristic->addDescriptor(new BLE2902());
   
   // Set callbacks
-  pAudioCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  // Use queue-based callback (no echo) to route BLE writes into mesh pipeline
+  pAudioCharacteristic->setCallbacks(new MyCallbacks());
   
   // Start the service
   pService->start();

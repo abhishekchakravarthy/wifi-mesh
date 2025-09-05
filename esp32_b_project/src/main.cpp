@@ -568,29 +568,15 @@ static void bleNotifyTask(void* pv) {
     while (ingested < 8) {
       NotifyItem item;
       if (!notifyQueuePop(item)) break;
-      if (item.isPcm8) {
-        // Convert 8-bit PCM to 16-bit PCM (legacy support)
-        static uint8_t pcm16[512];
-        int outLen = 0;
-        for (int i = 0; i < item.length && outLen + 2 <= (int)sizeof(pcm16); i++) {
-          uint8_t s8 = item.data[i];
-          int16_t s16 = ((int)s8 - 128) << 8;
-          pcm16[outLen++] = (uint8_t)(s16 & 0xFF);
-          pcm16[outLen++] = (uint8_t)((s16 >> 8) & 0xFF);
-        }
-        int copy = min(outLen, (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, pcm16, copy);
-        coalesceLen += copy;
-      } else {
-        // Raw 16-bit PCM data - forward directly without any processing
-        int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, item.data, copy);
-        coalesceLen += copy;
-      }
+      // Forward bytes as-is (u-law or other 8-bit formats) to Phone B
+      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
+      memcpy(coalesceBuf + coalesceLen, item.data, copy);
+      coalesceLen += copy;
       ingested++;
     }
     // Timed flush: send whenever at least 200B is ready; cap to 1280B per tick
     if (bleDeviceConnected && pAudioCharacteristic && coalesceLen >= 200) {
+      Serial.printf("BLE flush (task): sending %d bytes to Phone B\n", coalesceLen);
       int toSend = min(coalesceLen, 1280);
       int sent = 0;
       while (sent < toSend) {
@@ -696,9 +682,18 @@ void setup() {
     return;
   }
   
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  // match server config
+  // Build advertisement similar to ESP32 A for better discoverability
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06); // GENERAL_DISC_MODE | BR_EDR_NOT_SUPPORTED
+  advData.setServiceData(BLEUUID(SERVICE_UUID), "audio");
+  advData.setManufacturerData(std::string("WM"));
+  pAdvertising->setAdvertisementData(advData);
+
+  BLEAdvertisementData scanData;
+  scanData.setName(deviceName.c_str());
+  pAdvertising->setScanResponseData(scanData);
+
+  pAdvertising->setMinPreferred(0x0);
   BLEDevice::startAdvertising();
   bleAdvertising = true;
   Serial.println("   Advertising started (device advertising object)");
@@ -732,26 +727,10 @@ void setup() {
     int processed = 0;
     while (processed < 6 && notifyQueuePop(item)) {
       const int MAX_NOTIFY_BYTES = 160;
-      if (item.isPcm8) {
-        static uint8_t pcm16[512];
-        int outLen = 0;
-        for (int i = 0; i < item.length && outLen + 2 <= (int)sizeof(pcm16); i++) {
-          uint8_t s8 = item.data[i];
-          int16_t s16 = ((int)s8 - 128) << 8;
-          pcm16[outLen++] = (uint8_t)(s16 & 0xFF);
-          pcm16[outLen++] = (uint8_t)((s16 >> 8) & 0xFF);
-        }
-        int copy = min(outLen, (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, pcm16, copy);
-        coalesceLen += copy;
-      } else {
-        // Fallback silence for unexpected compressed payloads
-        static uint8_t silence[240];
-        memset(silence, 128, sizeof(silence));
-        int copy = min((int)sizeof(silence), (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, silence, copy);
-        coalesceLen += copy;
-      }
+      // Forward bytes as-is to Phone B (Android app decodes u-law)
+      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
+      memcpy(coalesceBuf + coalesceLen, item.data, copy);
+      coalesceLen += copy;
       processed++;
     }
     // Timed flush every ~25 ms or if buffer has >= 200B ready; cap per-flush to 1280B
@@ -1129,26 +1108,10 @@ void loop() {
     int processed = 0;
     while (processed < 32 && notifyQueuePop(item)) {
       const int MAX_NOTIFY_BYTES = 160;
-      if (item.isPcm8) {
-        static uint8_t pcm16[512];
-        int outLen = 0;
-        for (int i = 0; i < item.length && outLen + 2 <= (int)sizeof(pcm16); i++) {
-          uint8_t s8 = item.data[i];
-          int16_t s16 = ((int)s8 - 128) << 8;
-          pcm16[outLen++] = (uint8_t)(s16 & 0xFF);
-          pcm16[outLen++] = (uint8_t)((s16 >> 8) & 0xFF);
-        }
-        int copy = min(outLen, (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, pcm16, copy);
-        coalesceLen += copy;
-      } else {
-        // Fallback silence for unexpected compressed payloads
-        static uint8_t silence[240];
-        memset(silence, 128, sizeof(silence));
-        int copy = min((int)sizeof(silence), (int)sizeof(coalesceBuf) - coalesceLen);
-        memcpy(coalesceBuf + coalesceLen, silence, copy);
-        coalesceLen += copy;
-      }
+      // Forward bytes as-is
+      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
+      memcpy(coalesceBuf + coalesceLen, item.data, copy);
+      coalesceLen += copy;
       processed++;
     }
     // Timed flush every ~10 ms or if buffer has >= 200B ready; cap per-flush to 1440B
