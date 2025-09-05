@@ -127,39 +127,21 @@ static inline bool bleInPop(IncomingBleItem &out);
 void sendBeepOnce();
 volatile bool pendingBeep = false;
 
-// Core Mesh Management Functions
-bool addDeviceToMesh(const uint8_t* mac, const String& deviceName, const String& deviceType);
-bool removeDeviceFromMesh(const uint8_t* mac);
-void updateDeviceHeartbeat(const uint8_t* mac);
-void cleanupInactiveDevices();
-void updateMeshStatusLED();
+// FreeRTOS task handle for the audio sender
+TaskHandle_t AudioSenderTaskHandle = NULL;
 
-// Audio Broadcasting and Mesh Communication Functions
-void relayAudioToMesh(const uint8_t* sourceMac, const uint8_t* data, int len);
-void sendMeshAck(const uint8_t* mac, const String& status);
-void sendAudioAck(const uint8_t* mac);
-void sendMeshHeartbeat();
-void broadcastMeshStatus();
+// Dedicated task for sending audio data over BLE
+void AudioSenderTask(void *pvParameters) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(6); // Roughly 6.25ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
 
-// Test command handler for ESP-NOW testing - Enhanced version below
+  for (;;) {
+    // Wait for the next cycle.
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-// Send test acknowledgment
-void sendTestAck(const uint8_t* mac, int testId, const String& status) {
-  DynamicJsonDocument ackDoc(256);
-  ackDoc["type"] = "test_ack";
-  ackDoc["test_id"] = testId;
-  ackDoc["status"] = status;
-  ackDoc["source"] = "ESP32_A_Server";
-  ackDoc["timestamp"] = millis();
-  
-  String ackString;
-  serializeJson(ackDoc, ackString);
-  
-  esp_err_t result = esp_now_send(mac, (uint8_t*)ackString.c_str(), ackString.length());
-  if (result == ESP_OK) {
-    Serial.printf("✅ Test ACK sent to device for test %d\n", testId);
-  } else {
-    Serial.printf("❌ Failed to send test ACK: %d\n", result);
+    if (isAudioStreaming && (deviceConnected || meshDeviceCount > 0)) {
+      sendAudioChunks();
+    }
   }
 }
 
@@ -972,12 +954,11 @@ void sendBeepOnce() {
     }
     sineInit = true;
   }
-  uint32_t nextSendUs = micros();
-  const uint32_t framePeriodUs = 6250; // exact 6.25 ms pacing for 100 samples at 16 kHz
+
+  const TickType_t xFrequency = pdMS_TO_TICKS(6); // Use a 6ms tick delay, the closest to 6.25ms
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
   for (int f = 0; f < totalFrames; f++) {
-    while ((int32_t)(micros() - nextSendUs) < 0) {
-      delayMicroseconds(200);
-    }
     uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
     int rawSize = compressAudioData(sineFrame, AUDIO_CHUNK_SIZE, rawBuffer);
     uint16_t minVal, maxVal; uint32_t avgVal;
@@ -993,7 +974,7 @@ void sendBeepOnce() {
     int maxTotal = 250;
     int availableForData = maxTotal - messageLen - 1; // minus ':'
     if (availableForData <= 0) {
-      nextSendUs += framePeriodUs;
+      vTaskDelayUntil(&xLastWakeTime, xFrequency); // Still delay to maintain timing
       continue; // header too large, skip this frame
     }
     int toCopy = (rawSize < availableForData) ? rawSize : availableForData;
@@ -1010,19 +991,14 @@ void sendBeepOnce() {
     
     // CRITICAL FIX: Also send beep to BLE characteristic for Android app
     if (deviceConnected && pAudioCharacteristic != nullptr) {
-      // DEBUG: Print first 16 bytes of the sineFrame to verify content
-      Serial.printf("DEBUG sineFrame: ");
-      for(int i=0; i<16; i++) {
-        Serial.printf("%02X ", sineFrame[i]);
-      }
-      Serial.println();
-      
       // Send raw beep audio data directly to BLE characteristic
       pAudioCharacteristic->setValue(sineFrame, AUDIO_CHUNK_SIZE);
       pAudioCharacteristic->notify();
       Serial.printf("📱 Beep sent to BLE characteristic: %d bytes\n", AUDIO_CHUNK_SIZE);
     }
-    nextSendUs += framePeriodUs;
+    
+    // Use a precise, cooperative RTOS delay to pace the loop
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
 }
 
@@ -1350,6 +1326,17 @@ void setup() {
   
   // Blink status LED to indicate ready
   blinkStatusLED(0, 255, 255, 3); // Cyan blink when ready
+
+  // Create the dedicated audio sender task
+  xTaskCreatePinnedToCore(
+      AudioSenderTask,          /* Task function. */
+      "AudioSender",            /* name of task. */
+      4096,                     /* Stack size of task */
+      NULL,                     /* parameter of the task */
+      1,                        /* priority of the task */
+      &AudioSenderTaskHandle,   /* Task handle to keep track of created task */
+      1);                       /* pin task to core 1 */
+
 }
 
 void loop() {
@@ -1392,10 +1379,10 @@ void loop() {
     }
   }
   
-  // Audio streaming management
-  if (isAudioStreaming && meshNetworkActive) {
-    sendAudioChunks();
-  }
+  // Audio streaming management is now handled by the dedicated AudioSenderTask
+  // if (isAudioStreaming) {
+  //   sendAudioChunks();
+  // }
   
   // Mesh network management
   if (meshNetworkActive) {

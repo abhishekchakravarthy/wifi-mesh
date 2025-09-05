@@ -18,7 +18,7 @@ class AudioCaptureManager(
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val FRAME_SIZE = 100  // 6.25ms at 16kHz (matches ESP32 chunk size)
         private const val COMPRESSED_FRAME_SIZE = 200  // 100 samples * 2 bytes = 200 bytes
-        private const val PREBUFFER_BYTES = 1280 // 40ms of 16-bit mono
+        private const val PREBUFFER_BYTES = 3200 // 100ms of 16-bit mono - FINAL INCREASE
         
             // Direct playback - no buffering for minimal latency
     }
@@ -45,7 +45,7 @@ class AudioCaptureManager(
     private var bufferPrimed = false  // Track if buffer is ready for optimal processing
     
     // Audio playback buffer for received chunks - much larger buffer
-    private val playbackBuffer = ByteArray(4096)  // 4KB buffer for received audio
+    private val playbackBuffer = ByteArray(16384)  // 16KB buffer for received audio - FINAL INCREASE
     private var playbackBufferSize = 0
     private var playbackBufferIndex = 0
     private val playbackLock = Object()
