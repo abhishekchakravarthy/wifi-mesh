@@ -949,8 +949,8 @@ void calculateAudioStats(const uint8_t* data, int length, uint16_t& minVal, uint
 
 // Send a single 240-byte 1kHz 8-bit beep frame via optimized A: chunk
 void sendBeepOnce() {
-  if (meshDeviceCount == 0) {
-    Serial.println("⚠️ No mesh devices connected, cannot send beep");
+  if (meshDeviceCount == 0 && !deviceConnected) {
+    Serial.println("⚠️ No mesh or BLE devices connected, cannot send beep");
     return;
   }
   // Send a longer beep (~2000 ms)
@@ -1000,18 +1000,35 @@ void sendBeepOnce() {
     messageBuffer[messageLen++] = ':';
     memcpy(messageBuffer + messageLen, rawBuffer, toCopy);
     messageLen += toCopy;
-    for (int i = 0; i < meshDeviceCount; i++) {
-      if (meshDevices[i].isActive) {
-        esp_now_send(meshDevices[i].mac, (uint8_t*)messageBuffer, messageLen);
+    if (meshDeviceCount > 0) {
+      for (int i = 0; i < meshDeviceCount; i++) {
+        if (meshDevices[i].isActive) {
+          esp_now_send(meshDevices[i].mac, (uint8_t*)messageBuffer, messageLen);
+        }
       }
+    }
+    
+    // CRITICAL FIX: Also send beep to BLE characteristic for Android app
+    if (deviceConnected && pAudioCharacteristic != nullptr) {
+      // DEBUG: Print first 16 bytes of the sineFrame to verify content
+      Serial.printf("DEBUG sineFrame: ");
+      for(int i=0; i<16; i++) {
+        Serial.printf("%02X ", sineFrame[i]);
+      }
+      Serial.println();
+      
+      // Send raw beep audio data directly to BLE characteristic
+      pAudioCharacteristic->setValue(sineFrame, AUDIO_CHUNK_SIZE);
+      pAudioCharacteristic->notify();
+      Serial.printf("📱 Beep sent to BLE characteristic: %d bytes\n", AUDIO_CHUNK_SIZE);
     }
     nextSendUs += framePeriodUs;
   }
 }
 
 void sendAudioChunks() {
-  if (meshDeviceCount == 0) {
-    Serial.println("⚠️ No mesh devices connected, clearing audio buffer");
+  if (meshDeviceCount == 0 && !deviceConnected) {
+    Serial.println("⚠️ No mesh or BLE devices connected, clearing audio buffer");
     memset(audioBuffer, 0, AUDIO_BUFFER_SIZE);
     audioBufferIndex = 0;
     return;
@@ -1065,16 +1082,29 @@ void sendAudioChunks() {
         }
         
         // Send to all mesh devices
-        for (int i = 0; i < meshDeviceCount; i++) {
-          if (meshDevices[i].isActive) {
-            esp_err_t result = esp_now_send(meshDevices[i].mac, 
-                                           (uint8_t*)messageBuffer, 
-                                           messageLen);
-            (void)result;
+        if (meshDeviceCount > 0) {
+          for (int i = 0; i < meshDeviceCount; i++) {
+            if (meshDevices[i].isActive) {
+              esp_err_t result = esp_now_send(meshDevices[i].mac, 
+                                             (uint8_t*)messageBuffer, 
+                                             messageLen);
+              (void)result;
+            }
           }
+        }
+        
+        // CRITICAL FIX: Also send audio data to BLE characteristic for Android app
+        if (deviceConnected && pAudioCharacteristic != nullptr) {
+          // Send raw audio data directly to BLE characteristic
+          pAudioCharacteristic->setValue(rawBuffer, rawSize);
+          pAudioCharacteristic->notify();
+          Serial.printf("📱 Audio sent to BLE characteristic: %d bytes\n", rawSize);
         }
     
     lastAudioChunk = millis();
+    // NOTE: A hardcoded delay was removed from here. The main loop's delay provides general pacing.
+    // For high-throughput streaming, a more sophisticated pacing mechanism would be needed here,
+    // similar to the micros() loop in sendBeepOnce().
   }
   
   // Clear sent data from buffer - OPTIMIZED VERSION
@@ -1296,16 +1326,19 @@ void setup() {
   
   // Start advertising
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  // Provide complete local name in scan response for Android visibility
-  pAdvertising->setScanResponse(true);
+  
+  // Build the advertisement data packet
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06); // GENERAL_DISC_MODE | BR_EDR_NOT_SUPPORTED
+  advData.setServiceData(BLEUUID(SERVICE_UUID), "audio");
+  advData.setManufacturerData(std::string("WM"));
+  pAdvertising->setAdvertisementData(advData);
+
+  // Build the scan response packet
   BLEAdvertisementData scanData;
   scanData.setName(DEVICE_NAME);
   pAdvertising->setScanResponseData(scanData);
-  // Add small manufacturer data tag to adv packet
-  BLEAdvertisementData advData;
-  advData.setManufacturerData(std::string("WM"));
-  pAdvertising->setAdvertisementData(advData);
+  
   pAdvertising->setMinPreferred(0x0);  // keep minimal preferred params
   BLEDevice::startAdvertising();
   

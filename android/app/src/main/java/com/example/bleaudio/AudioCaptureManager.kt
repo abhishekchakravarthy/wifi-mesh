@@ -431,7 +431,7 @@ class AudioCaptureManager(
                     .setSampleRate(SAMPLE_RATE)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build())
-                .setBufferSizeInBytes(minBufferSize * 4) // Reduced buffer size
+                .setBufferSizeInBytes(minBufferSize * 10) // Large buffer for stability
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
@@ -458,59 +458,33 @@ class AudioCaptureManager(
     }
 
     fun playReceivedAudio(data: ByteArray, size: Int) {
+        // This is the final, simplified playback logic.
+        // It relies on a large AudioTrack hardware buffer to handle jitter,
+        // which is the standard and most robust method for audio streaming.
         try {
-            Log.d(TAG, "=== PLAY RECEIVED AUDIO CALLED ===")
-            Log.d(TAG, "Data size: $size bytes")
-            Log.d(TAG, "First 8 bytes: ${data.take(8).joinToString { "0x%02X".format(it) }}")
-            
-            // Ensure AudioTrack is initialized
-            if (audioTrack == null) {
-                Log.w(TAG, "AudioTrack not initialized, initializing now")
+            // Ensure AudioTrack is initialized and ready.
+            if (audioTrack == null || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
                 if (!initializePlayback()) {
-                    Log.e(TAG, "Failed to initialize AudioTrack for received audio")
+                    onError("Failed to initialize AudioTrack for playback")
                     return
                 }
             }
 
-            // Check AudioTrack state
-            val trackState = audioTrack?.state
-            val playState = audioTrack?.playState
-            Log.d(TAG, "AudioTrack state: $trackState, playState: $playState")
-            
-            if (trackState != AudioTrack.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioTrack not in INITIALIZED state: $trackState, attempting to reinitialize")
-                if (!initializePlayback()) {
-                    Log.e(TAG, "Failed to reinitialize AudioTrack")
-                    return
-                }
-            }
-
-            // Ensure AudioTrack is playing
+            // Ensure the track is playing.
             if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                Log.w(TAG, "AudioTrack not playing, starting playback")
                 audioTrack?.play()
             }
 
-            // Buffer into streaming circular buffer and start synchronized playback when enough data
-            val evenSize = if (size % 2 == 0) size else size - 1
-            synchronized(streamLock) {
-                for (i in 0 until evenSize) {
-                    streamBuffer[streamBufferIndex] = data[i]
-                    streamBufferIndex = (streamBufferIndex + 1) % streamBuffer.size
-                    streamBufferSize = minOf(streamBufferSize + 1, streamBuffer.size)
-                }
-                if (!isStreamStarted && streamBufferSize >= PREBUFFER_BYTES) {
-                    isStreamStarted = true
-                    lastPacketTime = System.currentTimeMillis()
-                    Log.d(TAG, "Starting synchronized stream playback (rx path) with ${streamBufferSize} bytes")
-                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                        processSynchronizedStream()
-                    }
+            // Write the incoming audio data directly to the AudioTrack's buffer.
+            // The audio hardware will pull from this buffer at the correct, stable rate.
+            if (size > 0) {
+                val written = audioTrack?.write(data, 0, size) ?: 0
+                if (written < size) {
+                    Log.w(TAG, "AudioTrack buffer might be full. Wrote $written of $size bytes.")
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error playing received audio", e)
-            e.printStackTrace()
         }
     }
     

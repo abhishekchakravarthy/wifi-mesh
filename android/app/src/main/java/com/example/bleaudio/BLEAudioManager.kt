@@ -110,13 +110,11 @@ class BLEAudioManager(
                         Log.w(TAG, "Failed to set connection priority: ${e.message}")
                     }
 
-                    // Request MTU for better performance
+                    // Request MTU for better performance. Service discovery will be triggered in onMtuChanged.
                     Log.d(TAG, "Requesting MTU: $TARGET_MTU")
-                    gatt.requestMtu(TARGET_MTU)
-                    
-                    // Discover services
-                    Log.d(TAG, "Discovering services...")
-                    gatt.discoverServices()
+                    mainHandler.postDelayed({
+                        gatt.requestMtu(TARGET_MTU)
+                    }, 200) // Small delay for stability
                 }
                 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -144,6 +142,11 @@ class BLEAudioManager(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "=== MTU NEGOTIATION SUCCESSFUL ===")
                 Log.d(TAG, "New MTU size: $mtu")
+                // Trigger service discovery after MTU negotiation is complete
+                Log.d(TAG, "Discovering services...")
+                mainHandler.postDelayed({
+                    gatt.discoverServices()
+                }, 200) // Small delay for stability
             } else {
                 Log.w(TAG, "MTU negotiation failed: $status")
             }
