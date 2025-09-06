@@ -757,6 +757,18 @@ void blinkStatusLED(uint8_t r, uint8_t g, uint8_t b, int times) {
   }
 }
 
+// Audio streaming constants for ESP-NOW - FIT ESP-NOW LIMITS
+#define AUDIO_CHUNK_SIZE 200  // steady-state chunk size
+#define AUDIO_SAMPLE_RATE 16000  // Match Android: 16kHz
+#define AUDIO_BITS_PER_SAMPLE 16  // Match Android: 16-bit
+#define AUDIO_CHANNELS 1  // Match Android: Mono
+#define AUDIO_COMPRESSION_RATIO 1  // No compression - raw PCM
+
+// Dynamic startup framing: send 100B frames for ~500ms after BLE connect, then 200B
+static int currentChunkSize = AUDIO_CHUNK_SIZE; // 100 during startup, 200 steady-state
+static unsigned long startupFrameUntilMs = 0;
+static bool startupFramingActive = false;
+
 // Callback class for server events
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -764,12 +776,19 @@ class MyServerCallbacks: public BLEServerCallbacks {
       Serial.println("=== DEVICE CONNECTED ===");
       digitalWrite(CONNECTION_LED_PIN, HIGH);
       updateMeshStatusLED(); // Use mesh status instead of hardcoded green
+      // Start startup framing window (100B frames) for ~500ms
+      startupFramingActive = true;
+      startupFrameUntilMs = millis() + 500;
+      currentChunkSize = 100;
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
       Serial.println("=== DEVICE DISCONNECTED ===");
       digitalWrite(CONNECTION_LED_PIN, LOW);
+      // Reset startup framing
+      startupFramingActive = false;
+      currentChunkSize = AUDIO_CHUNK_SIZE;
       if (meshDeviceCount > 0) {
         setStatusLED(0, 255, 255); // Cyan - mesh active, BLE disconnected
       } else {
@@ -823,12 +842,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// Audio streaming constants for ESP-NOW - FIT ESP-NOW LIMITS
-#define AUDIO_CHUNK_SIZE 200  // 100 samples * 2 bytes = 200 bytes (fits in 250B ESP-NOW limit)
-#define AUDIO_SAMPLE_RATE 16000  // Match Android: 16kHz
-#define AUDIO_BITS_PER_SAMPLE 16  // Match Android: 16-bit
-#define AUDIO_CHANNELS 1  // Match Android: Mono
-#define AUDIO_COMPRESSION_RATIO 1  // No compression - raw PCM
+// (definitions moved above MyServerCallbacks)
 
 // Audio streaming variables for ESP-NOW - RAW PCM
 int audioBufferIndex = 0;
@@ -1023,47 +1037,43 @@ void sendAudioChunks() {
   // Reduced logging to avoid heap churn during high-rate streams
   // Serial.printf("🔍 Buffer health: %d/%d bytes (%.1f%% full)\n", audioBufferIndex, AUDIO_BUFFER_SIZE, (float)audioBufferIndex / AUDIO_BUFFER_SIZE * 100.0);
   
-  int chunksToSend = audioBufferIndex / AUDIO_CHUNK_SIZE;
+  // If startup window elapsed and at boundary, switch to steady-state size
+  if (startupFramingActive && millis() >= startupFrameUntilMs && (audioBufferIndex % currentChunkSize) == 0) {
+    currentChunkSize = AUDIO_CHUNK_SIZE;
+    startupFramingActive = false;
+  }
+
+  int chunksToSend = audioBufferIndex / currentChunkSize;
   
   for (int chunk = 0; chunk < chunksToSend; chunk++) {
         // Forward incoming BLE bytes (u-law) directly without conversion
-        int startIndex = chunk * AUDIO_CHUNK_SIZE;
-        uint8_t rawBuffer[AUDIO_CHUNK_SIZE];
-        int rawSize = compressAudioData(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, rawBuffer);
+        int startIndex = chunk * currentChunkSize;
+        uint8_t rawBuffer[200];
+        int rawSize = compressAudioData(audioBuffer + startIndex, currentChunkSize, rawBuffer);
         
-        // Calculate audio statistics efficiently
-        uint16_t minVal, maxVal;
-        uint32_t avgVal;
-        calculateAudioStats(audioBuffer + startIndex, AUDIO_CHUNK_SIZE, minVal, maxVal, avgVal);
+        // Calculate audio statistics efficiently (optional)
+        uint16_t minVal, maxVal; uint32_t avgVal;
+        calculateAudioStats(audioBuffer + startIndex, currentChunkSize, minVal, maxVal, avgVal);
         
-        // Create raw PCM audio chunk message
-        char messageBuffer[300];  // Pre-allocated buffer for efficiency
+        // Create raw PCM audio chunk message (slim header to fit ESP-NOW)
+        char messageBuffer[240];
         int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
-                                 "P:%d:%d:%d:%d:%d:%d:%d:%d",
+                                 "P:%d:%d:%d:%d:%d:%d:",
                                  audioSequenceNumber++, chunk, chunksToSend,
-                                 millis(), 16000, 8,
-                                 minVal, maxVal);
+                                 millis(), 16000, 8);
         
         // Add raw PCM audio data directly
-        if (messageLen + rawSize + 1 < sizeof(messageBuffer)) {
-            messageBuffer[messageLen++] = ':';
-            memcpy(messageBuffer + messageLen, rawBuffer, rawSize);
-            messageLen += rawSize;
+        int maxAudio = (int)sizeof(messageBuffer) - messageLen;
+        int audioBytes = rawSize < maxAudio ? rawSize : maxAudio;
+        if (audioBytes > 0) {
+            memcpy(messageBuffer + messageLen, rawBuffer, audioBytes);
+            messageLen += audioBytes;
         }
         
-        // CRITICAL: Ensure message fits within ESP-NOW limits (250 bytes)
-        // Note: With 200-byte audio chunks, they fit within ESP-NOW limits
+        // Ensure message fits within ESP-NOW limits (<= 250 bytes)
         if (messageLen > 250) {
           Serial.printf("⚠️ Message too large for ESP-NOW: %d bytes (max 250)\n", messageLen);
-          // Split large audio chunks into smaller pieces
-          int maxAudioData = 250 - messageLen + rawSize; // Available space for audio data
-          if (maxAudioData > 0) {
-            messageLen = messageLen - rawSize + maxAudioData; // Adjust message length
-            memcpy(messageBuffer + (messageLen - maxAudioData), rawBuffer, maxAudioData);
-          } else {
-            Serial.printf("❌ Header too large, skipping chunk\n");
-            continue;
-          }
+          messageLen = 250;
         }
         
         // Send to all mesh devices
@@ -1087,10 +1097,10 @@ void sendAudioChunks() {
   }
   
   // Clear sent data from buffer - OPTIMIZED VERSION
-  int remainingData = audioBufferIndex % AUDIO_CHUNK_SIZE;
+  int remainingData = audioBufferIndex % currentChunkSize;
   if (remainingData > 0) {
     // Use memmove for efficient buffer shifting (safer than manual loop)
-    memmove(audioBuffer, audioBuffer + (chunksToSend * AUDIO_CHUNK_SIZE), remainingData);
+    memmove(audioBuffer, audioBuffer + (chunksToSend * currentChunkSize), remainingData);
     audioBufferIndex = remainingData;
     
     // Clear the unused portion of buffer to prevent data leakage

@@ -52,9 +52,11 @@ class BLEAudioManager(
     private var selectedDevice: BluetoothDevice? = null
     private var negotiatedMtu: Int = 23
     private var mtuReady: Boolean = false
-    private val frameSizeBytes: Int = 200
-    private val rxFrameBuffer = ByteArray(frameSizeBytes)
+    private val maxFrameSizeBytes: Int = 200
+    private val rxFrameBuffer = ByteArray(maxFrameSizeBytes)
     private var rxFrameIndex: Int = 0
+    private var currentFrameSizeBytes: Int = 200
+    private var startupFrameUntilMs: Long = 0L
     
     private val isScanning = AtomicBoolean(false)
     private val isConnected = AtomicBoolean(false)
@@ -209,6 +211,12 @@ class BLEAudioManager(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "=== NOTIFICATIONS ENABLED SUCCESSFULLY ===")
                 Log.d(TAG, "Ready to receive audio data")
+                // Ensure clean reassembly state at the moment notifications start
+                rxFrameIndex = 0
+                java.util.Arrays.fill(rxFrameBuffer, 0.toByte())
+                // Use smaller startup frames for ~500ms to avoid initial join
+                currentFrameSizeBytes = 100
+                startupFrameUntilMs = System.currentTimeMillis() + 500
             } else {
                 Log.w(TAG, "Failed to enable notifications: $status")
             }
@@ -387,7 +395,7 @@ class BLEAudioManager(
             audioCharacteristic!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             var offset = 0
             while (offset < size) {
-                val end = kotlin.math.min(offset + kotlin.math.min(frameSizeBytes, maxPayload), size)
+                val end = kotlin.math.min(offset + kotlin.math.min(currentFrameSizeBytes, maxPayload), size)
                 val slice = data.copyOfRange(offset, end)
                 audioCharacteristic!!.setValue(slice)
                 val ok = bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
@@ -453,17 +461,25 @@ class BLEAudioManager(
 
     // Reassemble incoming notification chunks into 200-byte frames before playback
     private fun ingestAndEmitFrames(chunk: ByteArray) {
+        // If startup window elapsed and we are at frame boundary, switch to 200B
+        if (startupFrameUntilMs != 0L && System.currentTimeMillis() >= startupFrameUntilMs && rxFrameIndex == 0 && currentFrameSizeBytes != 200) {
+            currentFrameSizeBytes = 200
+        }
         var offset = 0
         while (offset < chunk.size) {
-            val copyLen = kotlin.math.min(frameSizeBytes - rxFrameIndex, chunk.size - offset)
+            val target = currentFrameSizeBytes
+            val copyLen = kotlin.math.min(target - rxFrameIndex, chunk.size - offset)
             System.arraycopy(chunk, offset, rxFrameBuffer, rxFrameIndex, copyLen)
             rxFrameIndex += copyLen
             offset += copyLen
-            if (rxFrameIndex == frameSizeBytes) {
-                val frame = rxFrameBuffer.copyOf(frameSizeBytes)
-                Log.d(TAG, "Emitting complete frame of $frameSizeBytes bytes to playback")
+            if (rxFrameIndex == target) {
+                val frame = rxFrameBuffer.copyOf(target)
                 onAudioDataReceived(frame, frame.size)
                 rxFrameIndex = 0
+                // After emitting at boundary, re-check if we can switch to steady-state size
+                if (startupFrameUntilMs != 0L && System.currentTimeMillis() >= startupFrameUntilMs && currentFrameSizeBytes != 200) {
+                    currentFrameSizeBytes = 200
+                }
             }
         }
     }

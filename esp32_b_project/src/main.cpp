@@ -66,6 +66,7 @@ bool bleAdvertising = false;    // Set true after advertising starts
 // BLE Connection state
 bool bleDeviceConnected = false;
 bool oldBleDeviceConnected = false;
+static volatile bool bleResetPending = false;
 
 // BLE Error handling - simplified
 
@@ -422,16 +423,21 @@ void blinkStatusLED(uint8_t r, uint8_t g, uint8_t b, int times) {
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       bleDeviceConnected = true;
-      Serial.println("=== PHONE B CONNECTED ===");
+      bleResetPending = true; // reset buffers for clean session
+      Serial.println("BLE client connected");
       digitalWrite(BLE_LED_PIN, HIGH);
       setStatusLED(0, 255, 0); // Green when BLE connected
     };
 
     void onDisconnect(BLEServer* pServer) {
       bleDeviceConnected = false;
-      Serial.println("=== PHONE B DISCONNECTED ===");
+      bleResetPending = true; // reset buffers on disconnect
+      Serial.println("BLE client disconnected");
       digitalWrite(BLE_LED_PIN, LOW);
       setStatusLED(255, 0, 0); // Red when BLE disconnected
+      // Restart advertising quickly for reconnection
+      BLEDevice::startAdvertising();
+      bleAdvertising = true;
     }
 };
 
@@ -533,63 +539,114 @@ static bool parseCompactAudioHeader(const uint8_t* data, int len, int* values, i
   int idx = 2;
   int field = 0;
   int current = 0;
-  bool inNumber = false;
-  while (idx < len && field < 8) {
+  while (idx < len) {
     char c = (char)data[idx++];
     if (c == ':') {
       values[field++] = current;
       current = 0;
-      inNumber = false;
+      // Preferred behavior: stop as soon as 6 fields parsed; next byte is payload start
+      if (field >= 6) {
+        // Fill remaining values with defaults to keep caller logic simple
+        while (field < 8) values[field++] = 0;
+        dataStart = idx; // first payload byte right after this colon
+        return dataStart < len;
+      }
     } else if (c >= '0' && c <= '9') {
       current = current * 10 + (c - '0');
-      inNumber = true;
     } else {
-      // unsupported char
+      // unsupported char in header region
       return false;
     }
-  }
-  if (field == 8) {
-    dataStart = idx; // everything after last ':' is raw PCM payload
-    return dataStart < len;
   }
   return false;
 }
 
 // Dedicated BLE notify flush task (35 ms cadence, 1280B target)
-static void bleNotifyTask(void* pv) {
-  const int MAX_NOTIFY_BYTES = 160;
-  static uint8_t coalesceBuf[1536];
+static void bleNotifyTask(void *pvParameters) {
+  static uint8_t coalesceBuf[4096];
   static int coalesceLen = 0;
-  TickType_t lastWake = xTaskGetTickCount();
-  const TickType_t periodTicks = pdMS_TO_TICKS(25);
-  for (;;) {
-    // Ingest up to N items from notifyQueue each cycle
-    int ingested = 0;
-    while (ingested < 8) {
-      NotifyItem item;
-      if (!notifyQueuePop(item)) break;
-      // Forward bytes as-is (u-law or other 8-bit formats) to Phone B
-      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
-      memcpy(coalesceBuf + coalesceLen, item.data, copy);
-      coalesceLen += copy;
-      ingested++;
+  NotifyItem item;
+  static bool startupFramingInitialized = false;
+  static uint32_t startupFrameUntilMs = 0;
+  static int currentFrameSize = 200; // 100 during startup, then 200
+  
+  Serial.println("BLE notify task started");
+
+  while(1) {
+    // Apply pending resets atomically
+    if (bleResetPending) {
+      __atomic_store_n(&notifyHead, 0, __ATOMIC_RELEASE);
+      __atomic_store_n(&notifyTail, 0, __ATOMIC_RELEASE);
+      coalesceLen = 0;
+      bleResetPending = false;
+      Serial.println("BLE notify buffers reset");
     }
-    // Timed flush: send whenever at least 200B is ready; cap to 1280B per tick
-    if (bleDeviceConnected && pAudioCharacteristic && coalesceLen >= 200) {
-      Serial.printf("BLE flush (task): sending %d bytes to Phone B\n", coalesceLen);
-      int toSend = min(coalesceLen, 1280);
-      int sent = 0;
-      while (sent < toSend) {
-        int chunk = min(MAX_NOTIFY_BYTES, toSend - sent);
-        pAudioCharacteristic->setValue(coalesceBuf + sent, chunk);
-        pAudioCharacteristic->notify();
-        sent += chunk;
+
+    // Drain the queue as much as possible into the coalesce buffer
+    while (notifyQueuePop(item)) {
+        if (coalesceLen + item.length <= sizeof(coalesceBuf)) {
+            memcpy(coalesceBuf + coalesceLen, item.data, item.length);
+            coalesceLen += item.length;
+        } else {
+            Serial.println("Coalesce buffer overflow, discarding packet!");
+        }
+    }
+
+    // Check CCCD subscription state
+    bool subscribed = false;
+    if (pAudioCharacteristic) {
+      BLEDescriptor *desc = pAudioCharacteristic->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+      BLE2902 *cccd = desc ? (BLE2902*)desc : nullptr;
+      if (cccd && cccd->getNotifications()) {
+        subscribed = true;
       }
-      int remain = coalesceLen - toSend;
-      if (remain > 0) memmove(coalesceBuf, coalesceBuf + toSend, remain);
-      coalesceLen = remain;
     }
-    vTaskDelayUntil(&lastWake, periodTicks);
+
+    // If not subscribed or not connected, avoid accumulating backlog that would join speech later
+    if (!bleDeviceConnected || !subscribed) {
+      coalesceLen = 0; // drop until notifications are enabled
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Initialize startup framing window once when subscribed
+    if (!startupFramingInitialized) {
+      startupFramingInitialized = true;
+      startupFrameUntilMs = millis() + 500; // ~500ms of 100B frames
+      currentFrameSize = 100;
+    }
+
+    // If startup window elapsed and we are at a frame boundary, switch to 200B
+    if (startupFramingInitialized && currentFrameSize == 100 && millis() >= startupFrameUntilMs && coalesceLen == 0) {
+      currentFrameSize = 200;
+    }
+
+    // If connected and we have at least one full frame, send it
+    if (coalesceLen >= currentFrameSize) {
+      int flushBytes = (coalesceLen / currentFrameSize) * currentFrameSize; // whole frames only
+      
+      int sent = 0;
+      while (sent < flushBytes) {
+        pAudioCharacteristic->setValue(coalesceBuf + sent, currentFrameSize);
+        pAudioCharacteristic->notify();
+        sent += currentFrameSize;
+      }
+      
+      // Move any remaining partial frame to the start of the buffer
+      int remain = coalesceLen - flushBytes;
+      if (remain > 0) {
+        memmove(coalesceBuf, coalesceBuf + flushBytes, remain);
+      }
+      coalesceLen = remain;
+
+      // After flushing completely and startup window elapsed, switch to 200B
+      if (startupFramingInitialized && currentFrameSize == 100 && millis() >= startupFrameUntilMs && coalesceLen == 0) {
+        currentFrameSize = 200;
+      }
+    }
+    
+    // Wait before checking the queue again
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -718,39 +775,8 @@ void setup() {
   delay(1000); // Give BLE time to fully initialize
   setupESPNOWMesh();
 
-  // Process pending BLE notifications from queue (loop-based flush)
-  if (bleDeviceConnected && pAudioCharacteristic) {
-    static uint8_t coalesceBuf[1536];
-    static int coalesceLen = 0;
-    static uint32_t nextFlushMs = 0;
-    NotifyItem item;
-    int processed = 0;
-    while (processed < 6 && notifyQueuePop(item)) {
-      const int MAX_NOTIFY_BYTES = 160;
-      // Forward bytes as-is to Phone B (Android app decodes u-law)
-      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
-      memcpy(coalesceBuf + coalesceLen, item.data, copy);
-      coalesceLen += copy;
-      processed++;
-    }
-    // Timed flush every ~25 ms or if buffer has >= 200B ready; cap per-flush to 1280B
-    uint32_t nowMs = millis();
-    if (nextFlushMs == 0) nextFlushMs = nowMs + 25;
-    if (coalesceLen >= 200 || nowMs >= nextFlushMs) {
-      int toSend = min(coalesceLen, 1280);
-      int sent = 0;
-      while (sent < toSend) {
-        int chunk = min(160, toSend - sent);
-        pAudioCharacteristic->setValue(coalesceBuf + sent, chunk);
-        pAudioCharacteristic->notify();
-        sent += chunk;
-      }
-      int remain = coalesceLen - toSend;
-      if (remain > 0) memmove(coalesceBuf, coalesceBuf + toSend, remain);
-      coalesceLen = remain;
-      nextFlushMs = nowMs + 25;
-    }
-  }
+  // Start BLE notify flushing task to forward audio to Phone B
+  xTaskCreatePinnedToCore(bleNotifyTask, "bleNotifyTask", 4096, NULL, 1, NULL, 1);
 }
 
 // ESP-NOW Callback Functions
@@ -765,14 +791,8 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       int sequence = values[0];
       int chunk = values[1];
       int totalChunks = values[2];
-      unsigned long timestamp = (unsigned long)values[3];
-      int sampleRate = values[4];
-      int bitsPerSample = values[5];
-      uint16_t minVal = (uint16_t)values[6];
-      uint16_t maxVal = (uint16_t)values[7];
-      // Minimal meta log (throttled above)
-      if (millis() - lastBrief > 1000) { lastBrief = millis(); Serial.printf("Raw PCM Chunk %d/%d - Seq: %d, Rate: %d Hz, Bits: %d, Time: %lu\n", 
-                    chunk + 1, totalChunks, sequence, sampleRate, bitsPerSample, timestamp); }
+      // Note: fields [3..5] may exist or be defaults after slim header
+      // Avoid over-logging here to keep ISR-safe path clean
       if (dataStart > 0 && dataStart < len) {
         const uint8_t* rawPtr = ((const uint8_t*)data) + dataStart;
         int rawSize = len - dataStart;
@@ -792,7 +812,8 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
           memcpy(processed, silence, sizeof(silence));
         }
         if (bleDeviceConnected) {
-          (void)notifyQueuePushFromISR(processed, processedLen, 0);  // Raw 16-bit PCM
+          // Treat payload as 8-bit (µ-law) and forward as-is to Phone B
+          (void)notifyQueuePushFromISR(processed, processedLen, 1);
         } // drop silently if BLE not connected
 
         // Stats
@@ -1099,40 +1120,6 @@ void loop() {
     }
   }
 
-  // Process pending BLE notifications from queue (loop-based flush)
-  if (bleDeviceConnected && pAudioCharacteristic) {
-    static uint8_t coalesceBuf[4096];
-    static int coalesceLen = 0;
-    static uint32_t nextFlushMs = 0;
-    NotifyItem item;
-    int processed = 0;
-    while (processed < 32 && notifyQueuePop(item)) {
-      const int MAX_NOTIFY_BYTES = 160;
-      // Forward bytes as-is
-      int copy = min((int)item.length, (int)sizeof(coalesceBuf) - coalesceLen);
-      memcpy(coalesceBuf + coalesceLen, item.data, copy);
-      coalesceLen += copy;
-      processed++;
-    }
-    // Timed flush every ~10 ms or if buffer has >= 200B ready; cap per-flush to 1440B
-    uint32_t nowMs = millis();
-    if (nextFlushMs == 0) nextFlushMs = nowMs + 10;
-    if (coalesceLen >= 200 || nowMs >= nextFlushMs) {
-      int toSend = min(coalesceLen, 1440);
-      int sent = 0;
-      while (sent < toSend) {
-        int chunk = min(160, toSend - sent);
-        pAudioCharacteristic->setValue(coalesceBuf + sent, chunk);
-        pAudioCharacteristic->notify();
-        sent += chunk;
-      }
-      int remain = coalesceLen - toSend;
-      if (remain > 0) memmove(coalesceBuf, coalesceBuf + toSend, remain);
-      coalesceLen = remain;
-      nextFlushMs = nowMs + 10;
-    }
-  }
-  
   // Print statistics every 30 seconds (reduced spam)
   static unsigned long lastStatsTime = 0;
   if (millis() - lastStatsTime > 30000) {
