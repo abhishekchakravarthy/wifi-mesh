@@ -44,7 +44,9 @@ dependencies {
     implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.7.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     
-    // Opus codec - using simplified implementation
+    // Opus codec - using local AAR library
+    api fileTree(dir: 'libs', include: '*.jar')
+    api files('libs/opus.aar')
     
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.3'

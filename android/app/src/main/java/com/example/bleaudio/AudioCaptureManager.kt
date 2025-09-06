@@ -17,10 +17,10 @@ class AudioCaptureManager(
         private const val TAG = "AudioCaptureManager"
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT // REVERT to 16-BIT PCM
-        // Buffer size needs to be larger to send bigger packets less frequently
-        private const val FRAME_SIZE = 200  // Read 200 samples (12.5ms) at a time
-        private const val PACKET_SIZE_BYTES = 200 // 200 samples compressed to 200 u-law bytes
+        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        // Opus frame size: 20ms = 320 samples at 16kHz
+        private const val FRAME_SIZE = 320  // Read 320 samples (20ms) at a time for Opus
+        private const val PACKET_SIZE_BYTES = 4000 // Maximum Opus packet size
     }
 
     private var audioRecord: AudioRecord? = null
@@ -177,14 +177,23 @@ class AudioCaptureManager(
         Log.d(TAG, "Unified audio loop started.")
         val pcmBuffer = ShortArray(FRAME_SIZE)
         
+        // Initialize Opus codec
+        if (!OpusCodec.initialize()) {
+            Log.e(TAG, "Failed to initialize Opus codec")
+            onError("Opus initialization failed")
+            return
+        }
+        
         // Pre-buffering phase
         Log.d(TAG, "Pre-buffering to ensure smooth start...")
         val preBufferStartTime = System.currentTimeMillis()
         while (System.currentTimeMillis() - preBufferStartTime < 500) {
             val readResult = audioRecord?.read(pcmBuffer, 0, FRAME_SIZE, AudioRecord.READ_NON_BLOCKING) ?: 0
             if (readResult > 0) {
-                val encoded = MuLawCodec.encode(pcmBuffer, readResult)
-                onAudioData(encoded, encoded.size)
+                val encoded = OpusCodec.encode(pcmBuffer, readResult)
+                if (encoded != null) {
+                    onAudioData(encoded, encoded.size)
+                }
             }
             // Small delay to prevent a tight loop from starving other processes
             delay(10) 
@@ -197,9 +206,13 @@ class AudioCaptureManager(
             val readResult = audioRecord?.read(pcmBuffer, 0, FRAME_SIZE, AudioRecord.READ_NON_BLOCKING) ?: 0
             if (readResult > 0) {
                 Log.d(TAG, "MIC CAPTURE: ${pcmBuffer.take(8).joinToString()}")
-                val encoded = MuLawCodec.encode(pcmBuffer, readResult)
-                Log.d(TAG, "ENCODED SEND: ${encoded.take(8).joinToString { "0x%02X".format(it) }}")
-                onAudioData(encoded, encoded.size)
+                val encoded = OpusCodec.encode(pcmBuffer, readResult)
+                if (encoded != null) {
+                    Log.d(TAG, "ENCODED SEND: ${encoded.take(8).joinToString { "0x%02X".format(it) }}")
+                    onAudioData(encoded, encoded.size)
+                } else {
+                    Log.v(TAG, "DTX: No data to send (silence)")
+                }
             } else if (readResult < 0) {
                 Log.w(TAG, "AudioRecord read error: $readResult")
             }
@@ -208,13 +221,17 @@ class AudioCaptureManager(
             val data = playbackBuffer.poll() // Use non-blocking poll
             if (data != null) {
                 Log.d(TAG, "DECODING RECV: ${data.take(8).joinToString { "0x%02X".format(it) }}")
-                val decoded = MuLawCodec.decode(data, data.size)
-                Log.d(TAG, "PLAYING DECODED: ${decoded.take(8).joinToString()}")
-                if (decoded.isNotEmpty()) {
+                val decoded = OpusCodec.decode(data)
+                if (decoded != null) {
+                    Log.d(TAG, "PLAYING DECODED: ${decoded.take(8).joinToString()}")
                     val written = audioTrack?.write(decoded, 0, decoded.size) ?: 0
                     if (written < 0) {
                          Log.w(TAG, "AudioTrack write error: $written")
+                    } else {
+                        Log.v(TAG, "Audio written successfully: $written bytes")
                     }
+                } else {
+                    Log.w(TAG, "Opus decode failed for ${data.size} bytes")
                 }
             }
             
@@ -230,14 +247,15 @@ class AudioCaptureManager(
         while (playbackBuffer.isNotEmpty()) {
             val data = playbackBuffer.poll()
             if (data != null) {
-                val decoded = MuLawCodec.decode(data, data.size)
-                if (decoded.isNotEmpty()) {
+                val decoded = OpusCodec.decode(data)
+                if (decoded != null) {
                     audioTrack?.write(decoded, 0, decoded.size)
                 }
             }
         }
         
         Log.d(TAG, "Buffer drained. Releasing audio components.")
+        OpusCodec.cleanup()
         stopAudioComponents()
         Log.d(TAG, "Unified audio loop finished.")
     }
@@ -268,21 +286,35 @@ class AudioCaptureManager(
             isPlaybackActive = true
             playbackJob = CoroutineScope(Dispatchers.IO).launch {
                 Log.d(TAG, "Playback-only loop started")
+                
+                // Initialize Opus codec for playback-only mode
+                if (!OpusCodec.initialize()) {
+                    Log.e(TAG, "Failed to initialize Opus codec for playback-only mode")
+                    return@launch
+                }
+                
                 while (isPlaybackActive) {
                     val data = playbackBuffer.poll()
                     if (data != null) {
-                        val decoded = MuLawCodec.decode(data, data.size)
-                        if (decoded.isNotEmpty()) {
+                        Log.d(TAG, "Playback-only: Decoding ${data.size} bytes")
+                        val decoded = OpusCodec.decode(data)
+                        if (decoded != null) {
                             val written = audioTrack?.write(decoded, 0, decoded.size) ?: 0
                             if (written < 0) {
                                 Log.w(TAG, "AudioTrack write error (playback-only): $written")
+                            } else {
+                                Log.v(TAG, "Playback-only: Audio written successfully: $written bytes")
                             }
+                        } else {
+                            Log.w(TAG, "Playback-only: Opus decode failed for ${data.size} bytes")
                         }
                     } else {
                         // No data; avoid busy spin
                         delay(5)
                     }
                 }
+                
+                OpusCodec.cleanup()
                 Log.d(TAG, "Playback-only loop stopped")
             }
         } catch (e: Exception) {

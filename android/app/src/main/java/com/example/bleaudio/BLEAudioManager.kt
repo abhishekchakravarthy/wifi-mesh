@@ -52,7 +52,7 @@ class BLEAudioManager(
     private var selectedDevice: BluetoothDevice? = null
     private var negotiatedMtu: Int = 23
     private var mtuReady: Boolean = false
-    private val maxFrameSizeBytes: Int = 200
+    private val maxFrameSizeBytes: Int = 4000  // Match Opus max payload size
     private val rxFrameBuffer = ByteArray(maxFrameSizeBytes)
     private var rxFrameIndex: Int = 0
     private var currentFrameSizeBytes: Int = 200
@@ -388,15 +388,21 @@ class BLEAudioManager(
             bluetoothGatt?.discoverServices()
             return false
         }
+        
         try {
-            Log.d(TAG, "=== SENDING AUDIO DATA (MTU-AWARE CHUNKING) ===")
-            Log.d(TAG, "Data size: $size bytes, negotiatedMtu=$negotiatedMtu, mtuReady=$mtuReady")
+            // Create WM frame with Opus payload
+            val opusData = data.copyOf(size)
+            val wmFrame = OpusFrameFormat.createFrame(opusData)
+            
+            Log.d(TAG, "=== SENDING OPUS WM FRAME (MTU-AWARE CHUNKING) ===")
+            Log.d(TAG, "WM frame size: ${wmFrame.size} bytes, negotiatedMtu=$negotiatedMtu, mtuReady=$mtuReady")
             val maxPayload = kotlin.math.max(20, negotiatedMtu - 3)
             audioCharacteristic!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            
             var offset = 0
-            while (offset < size) {
-                val end = kotlin.math.min(offset + kotlin.math.min(currentFrameSizeBytes, maxPayload), size)
-                val slice = data.copyOfRange(offset, end)
+            while (offset < wmFrame.size) {
+                val end = kotlin.math.min(offset + maxPayload, wmFrame.size)
+                val slice = wmFrame.copyOfRange(offset, end)
                 audioCharacteristic!!.setValue(slice)
                 val ok = bluetoothGatt?.writeCharacteristic(audioCharacteristic!!) ?: false
                 if (!ok) {
@@ -459,27 +465,90 @@ class BLEAudioManager(
         return ok
     }
 
-    // Reassemble incoming notification chunks into 200-byte frames before playback
+    // Reassemble incoming notification chunks into WM frames before playback
     private fun ingestAndEmitFrames(chunk: ByteArray) {
-        // If startup window elapsed and we are at frame boundary, switch to 200B
-        if (startupFrameUntilMs != 0L && System.currentTimeMillis() >= startupFrameUntilMs && rxFrameIndex == 0 && currentFrameSizeBytes != 200) {
-            currentFrameSizeBytes = 200
-        }
+        // Append incoming bytes to buffer
         var offset = 0
         while (offset < chunk.size) {
-            val target = currentFrameSizeBytes
-            val copyLen = kotlin.math.min(target - rxFrameIndex, chunk.size - offset)
-            System.arraycopy(chunk, offset, rxFrameBuffer, rxFrameIndex, copyLen)
-            rxFrameIndex += copyLen
-            offset += copyLen
-            if (rxFrameIndex == target) {
-                val frame = rxFrameBuffer.copyOf(target)
-                onAudioDataReceived(frame, frame.size)
+            if (rxFrameIndex >= maxFrameSizeBytes) {
+                // Prevent overflow; reset and try to realign
+                Log.w(TAG, "Reassembly buffer overflow, resetting")
                 rxFrameIndex = 0
-                // After emitting at boundary, re-check if we can switch to steady-state size
-                if (startupFrameUntilMs != 0L && System.currentTimeMillis() >= startupFrameUntilMs && currentFrameSizeBytes != 200) {
-                    currentFrameSizeBytes = 200
+            }
+            val copy = kotlin.math.min(maxFrameSizeBytes - rxFrameIndex, chunk.size - offset)
+            System.arraycopy(chunk, offset, rxFrameBuffer, rxFrameIndex, copy)
+            rxFrameIndex += copy
+            offset += copy
+
+            // Try to extract as many complete WM frames as possible
+            var scanPos = 0
+            while (true) {
+                // Find 'W','M' in current buffer (including boundary cases)
+                var headerPos = -1
+                var i = scanPos
+                while (i + 1 < rxFrameIndex) {
+                    if (rxFrameBuffer[i] == 'W'.code.toByte() && rxFrameBuffer[i + 1] == 'M'.code.toByte()) {
+                        headerPos = i
+                        break
+                    }
+                    i++
                 }
+
+                if (headerPos == -1) {
+                    // Keep last 'W' if present at end to catch boundary 'WM' in next chunk
+                    val keep = if (rxFrameIndex > 0 && rxFrameBuffer[rxFrameIndex - 1] == 'W'.code.toByte()) 1 else 0
+                    if (keep == 1 && rxFrameIndex > 1) {
+                        rxFrameBuffer[0] = 'W'.code.toByte()
+                    }
+                    rxFrameIndex = keep
+                    break
+                }
+
+                // Discard bytes before header by shifting
+                if (headerPos > 0) {
+                    val remain = rxFrameIndex - headerPos
+                    System.arraycopy(rxFrameBuffer, headerPos, rxFrameBuffer, 0, remain)
+                    rxFrameIndex = remain
+                }
+
+                // We now have header at position 0
+                if (rxFrameIndex < 7) {
+                    // Need more bytes for header
+                    break
+                }
+                val expectedLen = (rxFrameBuffer[5].toInt() and 0xFF) or ((rxFrameBuffer[6].toInt() and 0xFF) shl 8)
+                val totalLen = 7 + expectedLen
+                if (expectedLen <= 0 || totalLen > maxFrameSizeBytes) {
+                    Log.w(TAG, "Invalid WM length ($expectedLen), dropping header and realigning")
+                    // Drop the 'W' and continue scanning
+                    System.arraycopy(rxFrameBuffer, 1, rxFrameBuffer, 0, rxFrameIndex - 1)
+                    rxFrameIndex -= 1
+                    scanPos = 0
+                    continue
+                }
+
+                if (rxFrameIndex < totalLen) {
+                    // Wait for more data
+                    break
+                }
+
+                // We have a complete frame at [0, totalLen)
+                val frame = rxFrameBuffer.copyOfRange(0, totalLen)
+                val parsed = OpusFrameFormat.parseFrame(frame)
+                if (parsed != null) {
+                    Log.d(TAG, "Complete WM frame parsed: seq=${parsed.sequenceNumber}, payload=${parsed.opusPayload.size} bytes")
+                    onAudioDataReceived(parsed.opusPayload, parsed.opusPayload.size)
+                } else {
+                    Log.w(TAG, "Failed to parse WM frame despite full length: $totalLen bytes")
+                }
+                // Shift remainder to start
+                val remainder = rxFrameIndex - totalLen
+                if (remainder > 0) {
+                    System.arraycopy(rxFrameBuffer, totalLen, rxFrameBuffer, 0, remainder)
+                }
+                rxFrameIndex = remainder
+                scanPos = 0
+                // Loop to try extract another frame if present
             }
         }
     }

@@ -114,6 +114,9 @@ void sendMeshHeartbeat();
 void broadcastMeshStatus();
 void handleTestCommand(const String& command);
 void sendTestAck(const uint8_t* mac, int testId, const String& status);
+// New: WM frame ingest/forward helpers
+static void ingestBleWmFrames(const uint8_t* data, int len);
+static void forwardWmToMesh(const uint8_t* frame, int frameLen);
 void startAudioStream();
 void stopAudioStream();
 void addAudioData(const uint8_t* data, int length);
@@ -829,14 +832,14 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
                 Serial.println("Received 'BEEP' command, triggering test tone.");
                 sendBeepOnce();
             } else {
-                Serial.printf("ECHO RECV: len=%d, data=", len);
+                Serial.printf("AUDIO RECV: len=%d, data=", len);
                 for (int i=0; i<min((size_t)8, len); i++) {
                     Serial.printf("%02X ", (uint8_t)value[i]);
                 }
                 Serial.println();
                 
-                pAudioCharacteristic->setValue((uint8_t*)value.data(), len);
-                pAudioCharacteristic->notify();
+                // Ingest BLE bytes as WM frames and forward to mesh unchanged
+                ingestBleWmFrames((const uint8_t*)value.data(), (int)len);
             }
         }
     }
@@ -857,6 +860,82 @@ struct IncomingBleItem {
 static volatile uint16_t bleInHead = 0;
 static volatile uint16_t bleInTail = 0;
 static IncomingBleItem bleInQueue[16];
+
+// Reassembly buffer for incoming WM frames from Phone A over BLE
+static uint8_t wmRxBuffer[4096];
+static int wmRxIndex = 0;
+static const int WM_MAX_FRAME = 4000; // payload cap
+
+static inline int wmExpectedFrameLen(const uint8_t* buf, int available) {
+  if (available < 7) return -1;
+  if (buf[0] != 'W' || buf[1] != 'M') return -2;
+  // type at [2], seq at [3..4]
+  int len = (buf[5] & 0xFF) | ((buf[6] & 0xFF) << 8);
+  if (len < 1 || len > WM_MAX_FRAME) return -3;
+  return 7 + len;
+}
+
+static void ingestBleWmFrames(const uint8_t* data, int len) {
+  if (len <= 0 || !data) return;
+  int offset = 0;
+  while (offset < len) {
+    // If buffer empty, try to align to WM magic
+    if (wmRxIndex == 0) {
+      int start = -1;
+      for (int i = offset; i + 1 < len; i++) {
+        if (data[i] == 'W' && data[i+1] == 'M') { start = i; break; }
+      }
+      if (start < 0) return; // no header in this chunk
+      offset = start;
+    }
+    // Copy as much as fits
+    int space = (int)sizeof(wmRxBuffer) - wmRxIndex;
+    if (space <= 0) { wmRxIndex = 0; return; }
+    int copyLen = (len - offset) < space ? (len - offset) : space;
+    memcpy(wmRxBuffer + wmRxIndex, data + offset, copyLen);
+    wmRxIndex += copyLen;
+    offset += copyLen;
+
+    // If we have at least a header, check if full frame is present
+    if (wmRxIndex >= 7) {
+      int expected = wmExpectedFrameLen(wmRxBuffer, wmRxIndex);
+      if (expected > 0 && wmRxIndex >= expected) {
+        // We have a complete WM frame: forward over mesh unchanged
+        forwardWmToMesh(wmRxBuffer, expected);
+        // Shift remaining bytes
+        int remain = wmRxIndex - expected;
+        if (remain > 0) memmove(wmRxBuffer, wmRxBuffer + expected, remain);
+        wmRxIndex = remain;
+      } else if (expected < 0) {
+        // Malformed or wrong magic: reset and try to realign within buffer
+        // Attempt to find next 'WM' inside current buffer
+        int realign = -1;
+        for (int i = 1; i + 1 < wmRxIndex; i++) {
+          if (wmRxBuffer[i] == 'W' && wmRxBuffer[i+1] == 'M') { realign = i; break; }
+        }
+        if (realign >= 0) {
+          int newLen = wmRxIndex - realign;
+          memmove(wmRxBuffer, wmRxBuffer + realign, newLen);
+          wmRxIndex = newLen;
+        } else {
+          wmRxIndex = 0;
+        }
+      }
+    }
+  }
+}
+
+static void forwardWmToMesh(const uint8_t* frame, int frameLen) {
+  if (!meshNetworkActive || frameLen <= 0 || !frame) return;
+  if (meshDeviceCount <= 0) return;
+  for (int i = 0; i < meshDeviceCount; i++) {
+    if (!meshDevices[i].isActive) continue;
+    esp_err_t result = esp_now_send(meshDevices[i].mac, (const uint8_t*)frame, frameLen);
+    if (result != ESP_OK) {
+      Serial.printf("Failed to forward WM to %s: %d\n", meshDevices[i].deviceName.c_str(), result);
+    }
+  }
+}
 
 static inline bool bleInPushFromISR(const uint8_t* buf, uint16_t len) {
   if (len > 256) len = 256;
@@ -1033,6 +1112,11 @@ void sendAudioChunks() {
     return;
   }
   
+  // Debug: Log buffer status
+  if (audioBufferIndex > 0) {
+    Serial.printf("🔍 Audio buffer: %d bytes, mesh devices: %d\n", audioBufferIndex, meshDeviceCount);
+  }
+  
   // Buffer health check
   // Reduced logging to avoid heap churn during high-rate streams
   // Serial.printf("🔍 Buffer health: %d/%d bytes (%.1f%% full)\n", audioBufferIndex, AUDIO_BUFFER_SIZE, (float)audioBufferIndex / AUDIO_BUFFER_SIZE * 100.0);
@@ -1055,20 +1139,28 @@ void sendAudioChunks() {
         uint16_t minVal, maxVal; uint32_t avgVal;
         calculateAudioStats(audioBuffer + startIndex, currentChunkSize, minVal, maxVal, avgVal);
         
-        // Create raw PCM audio chunk message (slim header to fit ESP-NOW)
+        // Create WM frame with Opus payload (type=1)
         char messageBuffer[240];
-        int messageLen = snprintf(messageBuffer, sizeof(messageBuffer),
-                                 "P:%d:%d:%d:%d:%d:%d:",
-                                 audioSequenceNumber++, chunk, chunksToSend,
-                                 millis(), 16000, 8);
+        int messageLen = 0;
         
-        // Add raw PCM audio data directly
+        // WM frame header: 'W','M', type=1, seq(le16), len(le16)
+        messageBuffer[messageLen++] = 'W';
+        messageBuffer[messageLen++] = 'M';
+        messageBuffer[messageLen++] = 1; // type=1 for Opus
+        messageBuffer[messageLen++] = (audioSequenceNumber & 0xFF); // seq low byte
+        messageBuffer[messageLen++] = ((audioSequenceNumber >> 8) & 0xFF); // seq high byte
+        messageBuffer[messageLen++] = (rawSize & 0xFF); // len low byte
+        messageBuffer[messageLen++] = ((rawSize >> 8) & 0xFF); // len high byte
+        
+        // Add Opus audio data
         int maxAudio = (int)sizeof(messageBuffer) - messageLen;
         int audioBytes = rawSize < maxAudio ? rawSize : maxAudio;
         if (audioBytes > 0) {
             memcpy(messageBuffer + messageLen, rawBuffer, audioBytes);
             messageLen += audioBytes;
         }
+        
+        audioSequenceNumber++;
         
         // Ensure message fits within ESP-NOW limits (<= 250 bytes)
         if (messageLen > 250) {
@@ -1083,7 +1175,13 @@ void sendAudioChunks() {
               esp_err_t result = esp_now_send(meshDevices[i].mac, 
                                              (uint8_t*)messageBuffer, 
                                              messageLen);
-              (void)result;
+              if (result == ESP_OK) {
+                Serial.printf("✅ Audio sent to mesh device %s: %d bytes\n", 
+                             meshDevices[i].deviceName.c_str(), messageLen);
+              } else {
+                Serial.printf("❌ Failed to send audio to %s: %d\n", 
+                             meshDevices[i].deviceName.c_str(), result);
+              }
             }
           }
         }
@@ -1308,8 +1406,8 @@ void setup() {
   pAudioCharacteristic->addDescriptor(new BLE2902());
   
   // Set callbacks
-  // Use queue-based callback (no echo) to route BLE writes into mesh pipeline
-  pAudioCharacteristic->setCallbacks(new MyCallbacks());
+  // Use direct callback to route BLE writes into audio pipeline
+  pAudioCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
   
   // Start the service
   pService->start();

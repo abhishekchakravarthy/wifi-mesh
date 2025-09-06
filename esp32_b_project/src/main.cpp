@@ -830,18 +830,20 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     }
     return; // Skip JSON parsing for raw PCM format
   }
-  // Binary framing: 'W','M', type(0=PCM8), seq(le16), len(le16), payload
+  // Binary framing: 'W','M', type(1=Opus), seq(le16), len(le16), payload
   if (len >= 7 && data[0] == 'W' && data[1] == 'M') {
     uint8_t type = data[2];
     uint16_t seq = (uint16_t)(data[3] | (data[4] << 8));
     uint16_t plen = (uint16_t)(data[5] | (data[6] << 8));
-    if (7 + plen <= len && type == 0 && plen > 0) {
-      const uint8_t* pcm8 = data + 7;
-      if (!notifyQueuePushFromISR(pcm8, plen, 1)) {
-        // drop silently
+    if (7 + plen <= len && type == 1 && plen > 0) {
+      // Forward the COMPLETE WM frame unchanged to Phone B (Android reassembles/parses)
+      const uint8_t* wmFrame = data;
+      uint16_t frameLen = (uint16_t)(7 + plen);
+      if (!notifyQueuePushFromISR(wmFrame, frameLen, 0)) {
+        // drop silently if queue full
       }
       packetsReceived++;
-      bytesReceived += plen;
+      bytesReceived += frameLen;
     }
     return;
   }
